@@ -63,7 +63,6 @@ ZHeap::ZHeap() :
     _young(&_page_table, &_page_allocator),
     _old(&_page_table, &_page_allocator),
     _initialized(false) {
-
   // Install global heap instance
   assert(_heap == NULL, "Already initialized");
   _heap = this;
@@ -191,18 +190,35 @@ bool ZHeap::is_in_page_relaxed(const ZPage* page, zaddress addr) const {
 
   // Could still be a from-object during an in-place relocation
   if (_old.is_phase_relocate()) {
-    const ZForwarding* const forwarding = _old.forwarding(unsafe(addr));
-    if (forwarding != NULL && forwarding->in_place_relocation_is_below_top_at_start(ZAddress::offset(addr))) {
-      return true;
+    if (_old.use_hash_forwarding) {
+      const void* const forwarding = (void*)_old.forwarding(unsafe(addr));
+      auto p = ((ZForwarding*)forwarding)->in_place_relocation_is_below_top_at_start(ZAddress::offset(addr));
+      if (forwarding != NULL && p) {
+        return true;
+      }
+    } else {
+      const void* const forwarding = (void*)_old.compact_forwarding(unsafe(addr));
+      auto p = ((ZCompactForwarding*)forwarding)->in_place_relocation_is_below_top_at_start(ZAddress::offset(addr));
+      if (forwarding != NULL && p) {
+        return true;
+      }
     }
   }
   if (_young.is_phase_relocate()) {
-    const ZForwarding* const forwarding = _young.forwarding(unsafe(addr));
-    if (forwarding != NULL && forwarding->in_place_relocation_is_below_top_at_start(ZAddress::offset(addr))) {
-      return true;
+    if (_young.use_hash_forwarding) {
+      const void* const forwarding = _young.forwarding(unsafe(addr));
+      auto p = ((ZForwarding*)forwarding)->in_place_relocation_is_below_top_at_start(ZAddress::offset(addr));
+      if (forwarding != NULL && p) {
+        return true;
+      }
+    } else {
+      const void* const forwarding = _young.compact_forwarding(unsafe(addr));
+      auto p = ((ZCompactForwarding*)forwarding)->in_place_relocation_is_below_top_at_start(ZAddress::offset(addr));
+      if (forwarding != NULL && p) {
+        return true;
+      }
     }
   }
-
   return false;
 }
 

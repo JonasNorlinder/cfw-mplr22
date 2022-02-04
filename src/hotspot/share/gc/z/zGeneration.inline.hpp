@@ -79,6 +79,10 @@ inline ZForwarding* ZGeneration::forwarding(zaddress_unsafe addr) const {
   return _forwarding_table.get(addr);
 }
 
+inline ZCompactForwarding* ZGeneration::compact_forwarding(zaddress_unsafe addr) const {
+  return _compact_forwarding_table.get(addr);
+}
+
 inline bool ZGeneration::should_worker_resize() {
   return _workers.should_worker_resize();
 }
@@ -115,6 +119,10 @@ inline const ZForwardingTable* ZGeneration::forwarding_table() const {
   return &_forwarding_table;
 }
 
+inline const ZCompactForwardingTable* ZGeneration::compact_forwarding_table() const {
+  return &_compact_forwarding_table;
+}
+
 template <bool resurrect, bool gc_thread, bool follow, bool finalizable>
 inline void ZGeneration::mark_object(zaddress addr) {
   _mark.mark_object<resurrect, gc_thread, follow, finalizable>(addr);
@@ -128,25 +136,43 @@ inline void ZGeneration::mark_object_if_active(zaddress addr) {
 }
 
 inline zaddress ZGeneration::relocate_or_remap_object(zaddress_unsafe addr) {
-  ZForwarding* const forwarding = _forwarding_table.get(addr);
-  if (forwarding == NULL) {
-    // Not forwarding
-    return safe(addr);
+  if (use_hash_forwarding) {
+    ZForwarding* const forwarding = _forwarding_table.get(addr);
+    if (forwarding == NULL) {
+      // Not forwarding
+      return safe(addr);
+    }
+    // Relocate object
+    return _relocate.relocate_object(forwarding, addr);
+  } else {
+    ZCompactForwarding* const compact_forwarding = _compact_forwarding_table.get(addr);
+    if (compact_forwarding == NULL) {
+      // Not forwarding
+      return safe(addr);
+    }
+    // Relocate object
+    return _relocate.compact_relocate_object(compact_forwarding, addr);
   }
-
-  // Relocate object
-  return _relocate.relocate_object(forwarding, addr);
 }
 
 inline zaddress ZGeneration::remap_object(zaddress_unsafe addr) {
-  ZForwarding* const forwarding = _forwarding_table.get(addr);
-  if (forwarding == NULL) {
-    // Not forwarding
-    return safe(addr);
+  if (use_hash_forwarding) {
+      ZForwarding* const forwarding = _forwarding_table.get(addr);
+    if (forwarding == NULL) {
+      // Not forwarding
+      return safe(addr);
+    }
+    // Remap object
+    return _relocate.forward_object(forwarding, addr);
+  } else {
+    ZCompactForwarding* const compact_forwarding = _compact_forwarding_table.get(addr);
+    if (compact_forwarding == NULL) {
+      // Not forwarding
+      return safe(addr);
+    }
+    // Remap object
+    return _relocate.compact_forward_object(compact_forwarding, addr);
   }
-
-  // Remap object
-  return _relocate.forward_object(forwarding, addr);
 }
 
 inline ZYoungType ZGenerationYoung::type() const {

@@ -39,7 +39,7 @@
 #include "memory/allocation.hpp"
 
 class ThreadClosure;
-class ZForwardingTable;
+class ZCompactForwardingTable;
 class ZGenerationOld;
 class ZPage;
 class ZPageAllocator;
@@ -55,6 +55,12 @@ protected:
   static ZGenerationYoung* _young;
   static ZGenerationOld*   _old;
 
+  ZRelocationSet        _relocation_set;
+  ZCompactRelocationSet _compact_relocation_set;
+
+  ZForwardingTable      _forwarding_table;
+  ZCompactForwardingTable      _compact_forwarding_table;
+
   enum class Phase {
     Mark,
     MarkComplete,
@@ -64,11 +70,11 @@ protected:
   const ZGenerationId   _id;
   ZPageAllocator* const _page_allocator;
   ZPageTable* const     _page_table;
-  ZForwardingTable      _forwarding_table;
+
   ZWorkers              _workers;
   ZMark                 _mark;
   ZRelocate             _relocate;
-  ZRelocationSet        _relocation_set;
+
 
   volatile size_t       _freed;
   volatile size_t       _promoted;
@@ -91,14 +97,15 @@ protected:
 
   void mark_free();
 
-  void select_relocation_set(bool promote_all);
-  void reset_relocation_set();
-
   ZGeneration(ZGenerationId id, ZPageTable* page_table, ZPageAllocator* page_allocator);
 
   void log_phase_switch(Phase from, Phase to);
 
+  void select_relocation_set(bool promote_all);
+  void reset_relocation_set();
+
 public:
+  bool use_hash_forwarding = false;
   bool is_initialized() const;
 
   // GC phases
@@ -117,6 +124,11 @@ public:
   static ZGenerationYoung* young();
   static ZGenerationOld* old();
   static ZGeneration* generation(ZGenerationId id);
+
+  const ZCompactForwardingTable* compact_forwarding_table() const;
+  ZCompactForwarding* compact_forwarding(zaddress_unsafe addr) const;
+  const ZForwardingTable* forwarding_table() const;
+  ZForwarding* forwarding(zaddress_unsafe addr) const;
 
   // Statistics
   void reset_statistics();
@@ -150,8 +162,6 @@ public:
   bool should_worker_stop();
 
   ZPageTable* page_table() const;
-  const ZForwardingTable* forwarding_table() const;
-  ZForwarding* forwarding(zaddress_unsafe addr) const;
 
   // Marking
   template <bool resurrect, bool gc_thread, bool follow, bool finalizable>
@@ -161,10 +171,10 @@ public:
   void mark_flush_and_free(Thread* thread);
 
   // Relocation
-  void synchronize_relocation();
-  void desynchronize_relocation();
   zaddress relocate_or_remap_object(zaddress_unsafe addr);
   zaddress remap_object(zaddress_unsafe addr);
+  void synchronize_relocation();
+  void desynchronize_relocation();
 
   // Threads
   void threads_do(ThreadClosure* tc) const;
@@ -184,6 +194,7 @@ public:
 };
 
 class ZGenerationYoung : public ZGeneration {
+  friend class ZGeneration;
   friend class VM_ZMarkStartYoungAndOld;
   friend class VM_ZMarkStartYoung;
   friend class VM_ZMarkEndYoung;
@@ -239,6 +250,7 @@ public:
 };
 
 class ZGenerationOld : public ZGeneration {
+  friend class ZGeneration;
   friend class VM_ZMarkStartYoungAndOld;
   friend class VM_ZMarkEndOld;
   friend class VM_ZRelocateStartOld;

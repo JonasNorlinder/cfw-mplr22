@@ -28,7 +28,7 @@
 #include "gc/z/zIndexDistributor.hpp"
 #include "memory/allocation.hpp"
 
-class ZForwarding;
+class ZCompactForwarding;
 class ZPage;
 
 class ZPageTable {

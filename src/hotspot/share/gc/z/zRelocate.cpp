@@ -51,6 +51,154 @@
 static const ZStatSubPhase ZSubPhaseConcurrentRelocateRememberedSetFlipPromotedYoung("Young: Concurrent Relocate Remset FP");
 static const ZStatSubPhase ZSubPhaseConcurrentRelocateRememberedSetNormalPromotedYoung("Young: Concurrent Relocate Remset NP");
 
+static uintptr_t forwarding_index(ZForwarding* forwarding, zoffset from_offset) {
+  return (from_offset - forwarding->start()) >> forwarding->object_alignment_shift();
+}
+
+static zaddress forwarding_find(ZForwarding* forwarding, zoffset from_offset, ZForwardingCursor* cursor) {
+  const uintptr_t from_index = forwarding_index(forwarding, from_offset);
+  const ZForwardingEntry entry = forwarding->find(from_index, cursor);
+  return entry.populated() ? ZOffset::address(to_zoffset(entry.to_offset())) : zaddress::null;
+}
+
+static zaddress forwarding_find(ZForwarding* forwarding, zaddress_unsafe from_addr, ZForwardingCursor* cursor) {
+   return forwarding_find(forwarding, ZAddress::offset(from_addr), cursor);
+}
+
+static zaddress forwarding_find(ZForwarding* forwarding, zaddress from_addr, ZForwardingCursor* cursor) {
+   return forwarding_find(forwarding, ZAddress::offset(from_addr), cursor);
+}
+
+static zaddress forwarding_insert(ZForwarding* forwarding, zoffset from_offset, zaddress to_addr, ZForwardingCursor* cursor) {
+  const uintptr_t from_index = forwarding_index(forwarding, from_offset);
+  const zoffset to_offset = ZAddress::offset(to_addr);
+  const zoffset to_offset_final = forwarding->insert(from_index, to_offset, cursor);
+  return ZOffset::address(to_offset_final);
+}
+
+static zaddress forwarding_insert(ZForwarding* forwarding, zaddress from_addr, zaddress to_addr, ZForwardingCursor* cursor) {
+  return forwarding_insert(forwarding, ZAddress::offset(from_addr), to_addr, cursor);
+}
+
+ZCompactRelocateQueue::ZCompactRelocateQueue() :
+    _lock(),
+    _queue(),
+    _nworkers(0),
+    _nsynchronized(0),
+    _synchronize(false),
+    _needs_attention(0) {}
+
+bool ZCompactRelocateQueue::needs_attention() const {
+  return Atomic::load(&_needs_attention) != 0;
+}
+
+void ZCompactRelocateQueue::inc_needs_attention() {
+  const int needs_attention = Atomic::add(&_needs_attention, 1);
+  assert(needs_attention == 1 || needs_attention == 2, "Invalid state");
+}
+
+void ZCompactRelocateQueue::dec_needs_attention() {
+  const int needs_attention = Atomic::sub(&_needs_attention, 1);
+  assert(needs_attention == 0 || needs_attention == 1, "Invalid state");
+}
+
+void ZCompactRelocateQueue::join(uint nworkers) {
+  assert(_nworkers == 0, "Invalid state");
+  assert(_nsynchronized == 0, "Invalid state");
+  _nworkers = nworkers;
+}
+
+void ZCompactRelocateQueue::leave() {
+  ZLocker<ZConditionLock> locker(&_lock);
+  _nworkers--;
+  if (_synchronize && _nworkers == _nsynchronized) {
+    // All workers synchronized
+    _lock.notify_all();
+  }
+}
+
+void ZCompactRelocateQueue::add(ZCompactForwarding* forwarding) {
+  ZLocker<ZConditionLock> locker(&_lock);
+  if (forwarding->retain_page()) {
+    _queue.append(forwarding);
+    forwarding->release_page();
+    if (_queue.length() == 1) {
+      // Queue became non-empty
+      inc_needs_attention();
+      _lock.notify_all();
+    }
+  }
+}
+
+bool ZCompactRelocateQueue::poll(ZCompactForwarding** forwarding, bool* synchronized) {
+  // Fast path avoids locking
+  if (!needs_attention() && !*synchronized) {
+    return false;
+  }
+
+  // Slow path to get the next forwarding and/or synchronize
+  ZLocker<ZConditionLock> locker(&_lock);
+
+  if (_synchronize && !*synchronized) {
+    // Synchronize
+    *synchronized = true;
+    _nsynchronized++;
+    if (_nsynchronized == _nworkers) {
+      // All workers synchronized
+      _lock.notify_all();
+    }
+  }
+
+  // Wait for queue to become non-empty or desynchronized
+  while (_queue.is_empty() && _synchronize) {
+    _lock.wait();
+  }
+
+  if (!_synchronize && *synchronized) {
+    // Desynchronize
+    *synchronized = false;
+    _nsynchronized--;
+  }
+
+  // Check if queue is empty
+  if (_queue.is_empty()) {
+    return false;
+  }
+
+  // Get and remove first
+  *forwarding = _queue.at(0);
+  _queue.remove_at(0);
+  if (_queue.is_empty()) {
+    dec_needs_attention();
+  }
+
+  return true;
+}
+
+void ZCompactRelocateQueue::clear() {
+  assert(_nworkers == 0, "Invalid state");
+  if (!_queue.is_empty()) {
+    _queue.clear();
+    dec_needs_attention();
+  }
+}
+
+void ZCompactRelocateQueue::synchronize() {
+  ZLocker<ZConditionLock> locker(&_lock);
+  _synchronize = true;
+  inc_needs_attention();
+  while (_nworkers != _nsynchronized) {
+    _lock.wait();
+  }
+}
+
+void ZCompactRelocateQueue::desynchronize() {
+  ZLocker<ZConditionLock> locker(&_lock);
+  _synchronize = false;
+  dec_needs_attention();
+  _lock.notify_all();
+}
+
 ZRelocateQueue::ZRelocateQueue() :
     _lock(),
     _queue(),
@@ -182,33 +330,8 @@ void ZRelocate::start() {
   _queue.join(workers()->active_workers());
 }
 
-static uintptr_t forwarding_index(ZForwarding* forwarding, zoffset from_offset) {
-  return (from_offset - forwarding->start()) >> forwarding->object_alignment_shift();
-}
-
-static zaddress forwarding_find(ZForwarding* forwarding, zoffset from_offset, ZForwardingCursor* cursor) {
-  const uintptr_t from_index = forwarding_index(forwarding, from_offset);
-  const ZForwardingEntry entry = forwarding->find(from_index, cursor);
-  return entry.populated() ? ZOffset::address(to_zoffset(entry.to_offset())) : zaddress::null;
-}
-
-static zaddress forwarding_find(ZForwarding* forwarding, zaddress_unsafe from_addr, ZForwardingCursor* cursor) {
-   return forwarding_find(forwarding, ZAddress::offset(from_addr), cursor);
-}
-
-static zaddress forwarding_find(ZForwarding* forwarding, zaddress from_addr, ZForwardingCursor* cursor) {
-   return forwarding_find(forwarding, ZAddress::offset(from_addr), cursor);
-}
-
-static zaddress forwarding_insert(ZForwarding* forwarding, zoffset from_offset, zaddress to_addr, ZForwardingCursor* cursor) {
-  const uintptr_t from_index = forwarding_index(forwarding, from_offset);
-  const zoffset to_offset = ZAddress::offset(to_addr);
-  const zoffset to_offset_final = forwarding->insert(from_index, to_offset, cursor);
-  return ZOffset::address(to_offset_final);
-}
-
-static zaddress forwarding_insert(ZForwarding* forwarding, zaddress from_addr, zaddress to_addr, ZForwardingCursor* cursor) {
-  return forwarding_insert(forwarding, ZAddress::offset(from_addr), to_addr, cursor);
+void ZRelocate::start_compact() {
+  _compact_queue.join(workers()->active_workers());
 }
 
 void ZRelocate::add_remset(volatile zpointer* p) {
@@ -248,6 +371,95 @@ static zaddress relocate_object_inner(ZForwarding* forwarding, zaddress from_add
   }
 
   return to_addr_final;
+}
+
+static zaddress compact_relocate_object_inner(ZCompactForwarding* forwarding, zaddress from_addr) {
+  assert(ZHeap::heap()->is_object_live(from_addr), "Should be live");
+  const size_t size = ZUtils::object_size(from_addr);
+
+  ZCompactForwardingEntry* const e = forwarding->find(from_addr);
+  if (e == NULL || ZStressRelocateInPlace) {
+    // Allocation failed for page.
+    return zaddress::null;
+  }
+
+  const ZEntryStatus status = e->wait_until_locked_or_relocated();
+  if (status != ZEntryStatus::relocated) {
+    // Reallocate all live objects within fragment
+    const int32_t last_live_index = e->last_live();
+    size_t offset_index = forwarding->has_snd_page() && from_addr >= forwarding->_first_on_snd_page ?
+      forwarding->addr_to_index(from_addr) - 1 : forwarding->addr_to_index(from_addr);
+
+    int32_t cursor = e->get_next_live_object(0, false);
+
+    while (true) {
+      const zaddress from_addr_entry = forwarding->from(offset_index, (size_t)cursor);
+      const zaddress to_addr = forwarding->to(from_addr_entry, e);
+      const size_t size = cursor == last_live_index ?
+        ZUtils::object_size(from_addr_entry) : e->get_size(cursor);
+      ZUtils::object_copy_disjoint(from_addr_entry, to_addr, size);
+
+      cursor = e->get_next_live_object(cursor, true);
+      if (cursor == -1) {
+        break;
+      }
+    }
+
+    e->unlock_and_mark_relocated();
+  }
+  assert(e->is_relocated(), "either fixed in place or normal");
+  return forwarding->to(from_addr, e);
+}
+
+zaddress ZRelocate::compact_relocate_object(ZCompactForwarding* forwarding, zaddress_unsafe from_addr) {
+  auto success = forwarding->retain_page();
+  // Lookup forwarding
+  ZCompactForwardingEntry* e = forwarding->find((zaddress) from_addr);
+  if (success) forwarding->release_page();
+
+  if (e == NULL) {
+    // should be in-place relocated
+    _compact_queue.add(forwarding);
+    // Could get spurious crashes on System.exit();
+    bool not_aborted = forwarding->wait_page_released();
+    assert(not_aborted, "aborted not yet handled");
+    e = forwarding->find_raw((zaddress)from_addr);
+  }
+
+  if (e->is_relocated()) {
+    // Already relocated
+    const zaddress to_addr = forwarding->to((zaddress)from_addr, e);
+    return to_addr;
+  }
+
+  // Relocate object
+  if (forwarding->retain_page()) {
+    zaddress to_addr = compact_relocate_object_inner(forwarding, safe(from_addr));
+    forwarding->release_page();
+
+    // In place for mutator
+    if (to_addr == zaddress::null) {
+      // Signal and wait for GC threads to do in-place relocation
+      _compact_queue.add(forwarding);
+
+      bool not_aborted = forwarding->wait_page_released();
+      assert(not_aborted, "abort not expected/handled for now");
+      assert(e->is_relocated(), "in place just ran so should be fixed here");
+      to_addr = forwarding->to((zaddress)from_addr, e);
+    }
+
+    assert(to_addr != zaddress::null, "");
+    return to_addr;
+  }
+
+  // Forward object
+  return compact_forward_object(forwarding, from_addr);
+}
+
+zaddress ZRelocate::compact_forward_object(ZCompactForwarding* forwarding, zaddress_unsafe from_addr) {
+  const zaddress to_addr = forwarding->to_addr(zaddress(from_addr));
+  assert(!is_null(to_addr), "Should be forwarded: " PTR_FORMAT, untype(from_addr));
+  return to_addr;
 }
 
 zaddress ZRelocate::relocate_object(ZForwarding* forwarding, zaddress_unsafe from_addr) {
@@ -355,6 +567,24 @@ public:
     return page;
   }
 
+  ZPage* alloc_and_retire_target_page(ZCompactForwarding* forwarding, ZPage* target) {
+    ZPage* const page = alloc_page(_allocator, forwarding->type(), forwarding->size());
+    if (page == NULL) {
+      Atomic::inc(&_in_place_count);
+    }
+
+    if (target != NULL) {
+      // Retire the old target page
+      retire_target_page(_generation, target);
+    }
+
+    return page;
+  }
+
+  void inc_in_place_count() {
+      Atomic::inc(&_in_place_count);
+  }
+
   void share_target_page(ZPage* page) {
     // Does nothing
   }
@@ -430,10 +660,42 @@ public:
     return _shared;
   }
 
+  ZPage* alloc_and_retire_target_page(ZCompactForwarding* forwarding, ZPage* target) {
+    ZLocker<ZConditionLock> locker(&_lock);
+
+    // Wait for any ongoing in-place relocation to complete
+    while (_in_place) {
+      _lock.wait();
+    }
+
+    // Allocate a new page only if the shared page is the same as the
+    // current target page. The shared page will be different from the
+    // current target page if another thread shared a page, or allocated
+    // a new page.
+    if (_shared == target) {
+      _shared = alloc_page(_allocator, forwarding->type(), forwarding->size());
+      if (_shared == NULL) {
+        Atomic::inc(&_in_place_count);
+        _in_place = true;
+      }
+
+      // This thread is responsible for retiring the shared target page
+      if (target != NULL) {
+        retire_target_page(_generation, target);
+      }
+    }
+
+    return _shared;
+  }
+
+  void inc_in_place_count() {
+      Atomic::inc(&_in_place_count);
+  }
+
   void share_target_page(ZPage* page) {
     ZLocker<ZConditionLock> locker(&_lock);
 
-    assert(_in_place, "Invalid state");
+    assert(_in_place || ZStressRelocateInPlace, "Invalid state");
     assert(_shared == NULL, "Invalid state");
     assert(page != NULL, "Invalid page");
 
@@ -457,6 +719,346 @@ public:
 
   const size_t in_place_count() const {
     return _in_place_count;
+  }
+};
+
+template <typename Allocator>
+class ZCompactRelocateWork : public StackObj {
+private:
+  Allocator* const   _allocator;
+  ZCompactForwarding*       _forwarding;
+  ZPage*             _target;
+  ZGeneration* const _generation;
+  size_t             _other_promoted;
+  size_t             _other_compacted;
+
+  size_t object_alignment() const {
+    return (size_t)1 << _forwarding->object_alignment_shift();
+  }
+
+  void increase_other_forwarded(size_t unaligned_object_size) {
+    const size_t aligned_size = align_up(unaligned_object_size, object_alignment());
+    if (_forwarding->is_promotion()) {
+      _other_promoted += aligned_size;
+    } else {
+      _other_compacted += aligned_size;
+    }
+  }
+
+  zaddress try_relocate_fragment_inner(ZCompactForwardingEntry* entry, ZPage* in_place) const {
+    uintptr_t to_page_start = 0UL;
+    if (in_place) {
+      to_page_start = (uintptr_t) in_place->start() | ZAddressHeapBase;
+    } else {
+      if (_forwarding->has_to_page(entry) == false) {
+        /// First attempt to relocate without to-page --- will lead to in-place call
+        return zaddress::null;
+      } else {
+        to_page_start = _forwarding->to_page_start(entry);
+      }
+    }
+
+    const ZEntryStatus status = entry->wait_until_locked_or_relocated();
+
+    // Reallocate all live objects within fragment
+    const int32_t last_live_index = entry->last_live();
+    const size_t offset_index = _forwarding->has_snd_page() && entry >= _forwarding->_first_on_snd_page_entry ?
+      (entry - _forwarding->_compact_entries - 1) : (entry - _forwarding->_compact_entries);
+
+    int32_t cursor = entry->get_next_live_object(0, false);
+    while (true) {
+      const zaddress from_addr_entry = _forwarding->from(offset_index, (size_t)cursor);
+      const zaddress to_addr = (zaddress)(((size_t)_forwarding->to_offset(from_addr_entry, entry)) + to_page_start);
+      if (status != ZEntryStatus::relocated) {
+        const size_t size = cursor == last_live_index ?
+          ZUtils::object_size(from_addr_entry) : entry->get_size(cursor);
+        if (in_place && to_addr + size > from_addr_entry) {
+          ZUtils::object_copy_conjoint(from_addr_entry, to_addr, size);
+        } else {
+          ZUtils::object_copy_disjoint(from_addr_entry, to_addr, size);
+        }
+      }
+
+      update_remset_for_fields(from_addr_entry, to_addr);
+      cursor = entry->get_next_live_object(cursor, true);
+      if (cursor == -1) {
+        break;
+      }
+    }
+
+    if (status != ZEntryStatus::relocated) {
+      entry->unlock_and_mark_relocated();
+    }
+    assert(entry->is_relocated(), "");
+
+    return (zaddress)1;
+  }
+
+  void update_remset_old_to_old(zaddress from_addr, zaddress to_addr) const {
+    // Old-to-old relocation - move existing remset bits
+
+    // If this is called for an in-place relocated page, then this code has the
+    // responsibility to clear the old remset bits. Extra care is needed because:
+    //
+    // 1) The to-object copy can overlap with the from-object copy
+    // 2) Remset bits of old objects need to be cleared
+    //
+    // A watermark is used to keep track of how far the old remset bits have been removed.
+
+    const bool in_place = _forwarding->in_place_relocation();
+    ZPage* const from_page = _forwarding->page();
+    const uintptr_t from_local_offset = from_page->local_offset(from_addr);
+
+    if (in_place) {
+      // Make sure remset entries of dead objects are cleared
+      _forwarding->in_place_relocation_clear_remset_up_to(from_local_offset);
+    }
+
+    // Note: even with in-place relocation, the to_page could be another page
+    ZPage* const to_page = ZHeap::heap()->page(to_addr);
+
+    // Uses _relaxed version to handle that in-place relocation resets _top
+    assert(ZHeap::heap()->is_in_page_relaxed(from_page, from_addr), "Must be");
+    assert(to_page->is_in(to_addr), "Must be");
+
+
+    // Read the size from the to-object, since the from-object
+    // could have been overwritten during in-place relocation.
+    const size_t size = ZUtils::object_size(to_addr);
+
+    ZRememberedSetIterator iter = from_page->remset_iterator_current_limited(from_local_offset, size);
+    for (uintptr_t field_local_offset; iter.next(&field_local_offset);) {
+      if (in_place) {
+        // Need to forget the bit in the from-page. This is performed during
+        // in-place relocation, which will slide the objects in the current page.
+        from_page->clear_remset_non_par(field_local_offset);
+      }
+
+      // Add remset entry in the to-page
+      const uintptr_t offset = field_local_offset - from_local_offset;
+      const zaddress to_field = to_addr + offset;
+      log_trace(gc, reloc)("Remember: " PTR_FORMAT, untype(to_field));
+      to_page->remember((volatile zpointer*)to_field);
+    }
+
+    if (in_place) {
+      // Record that the code above cleared all remset bits inside the from-object
+      _forwarding->in_place_relocation_set_clear_remset_watermark(from_local_offset + size);
+    }
+  }
+
+  void update_remset_promoted_all(zaddress to_addr) const {
+    ZRelocate::add_remset_for_fields(to_addr);
+  }
+
+  static bool add_remset_if_young(volatile zpointer* p, zaddress addr) {
+    if (ZHeap::heap()->is_young(addr)) {
+      ZRelocate::add_remset(p);
+      return true;
+    }
+
+    return false;
+  }
+
+  static void update_remset_promoted_filter_and_remap_per_field(volatile zpointer* p) {
+    const zpointer ptr = Atomic::load(p);
+
+    assert(ZPointer::is_old_load_good(ptr), "Should be at least old load good: " PTR_FORMAT, untype(ptr));
+
+    if (ZPointer::is_store_good(ptr)) {
+      // Already has a remset entry
+      return;
+    }
+
+    if (ZPointer::is_load_good(ptr)) {
+      if (!is_null_any(ptr)) {
+        const zaddress addr = ZPointer::uncolor(ptr);
+        add_remset_if_young(p, addr);
+      }
+      // No need to remap it is already load good
+      return;
+    }
+
+    if (is_null_any(ptr)) {
+      // Eagerly remap to skip adding a remset entry just to get deferred remapping
+      ZBarrier::remap_young_relocated(p, ptr);
+      return;
+    }
+
+    zaddress_unsafe addr_unsafe = ZPointer::uncolor_unsafe(ptr);
+    ZCompactForwarding* forwarding = ZGeneration::young()->compact_forwarding(addr_unsafe);
+
+    if (forwarding == NULL) {
+      // Object isn't being relocated
+      zaddress addr = safe(addr_unsafe);
+      if (!add_remset_if_young(p, addr)) {
+        // Not young - eagerly remap to skip adding a remset entry just to get deferred remapping
+        ZBarrier::remap_young_relocated(p, ptr);
+      }
+      return;
+    }
+
+    ZCompactForwardingEntry* entry = forwarding->find_raw((zaddress)addr_unsafe);
+
+    if (entry->is_relocated()) {
+      // Object has already been relocated
+      if (!add_remset_if_young(p, forwarding->to((zaddress)addr_unsafe, entry))) {
+        // Not young - eagerly remap to skip adding a remset entry just to get deferred remapping
+        ZBarrier::remap_young_relocated(p, ptr);
+      }
+      return;
+    }
+
+    // Object has not been relocated yet
+    // Don't want to eagerly relocate objects, so just add a remset
+    ZRelocate::add_remset(p);
+    return;
+  }
+
+  void update_remset_promoted_filter_and_remap(zaddress to_addr) const {
+    ZIterator::basic_oop_iterate(to_oop(to_addr), update_remset_promoted_filter_and_remap_per_field);
+  }
+
+  void update_remset_promoted(zaddress to_addr) const {
+    switch (ZRelocateRemsetStrategy) {
+    case 0: update_remset_promoted_all(to_addr); break;
+    case 1: update_remset_promoted_filter_and_remap(to_addr); break;
+    case 2: /* Handled after relocation is done */ break;
+    default: fatal("Unsupported ZRelocateRemsetStrategy"); break;
+    };
+  }
+
+  void update_remset_for_fields(zaddress from_addr, zaddress to_addr) const {
+    if (_forwarding->to_age() == ZPageAge::old) {
+      // Need to deal with remset when moving stuff to old
+      if (_forwarding->from_age() == ZPageAge::old) {
+        update_remset_old_to_old(from_addr, to_addr);
+      } else {
+        update_remset_promoted(to_addr);
+      }
+    }
+  }
+
+  bool try_relocate_fragment(ZCompactForwardingEntry* entry, ZPage* in_place) const {
+    zaddress to_addr = try_relocate_fragment_inner(entry, in_place);
+
+    if (is_null(to_addr)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  ZPage* start_in_place_relocation() {
+    printf("in place\n");
+    _forwarding->in_place_relocation_claim_page();
+
+    // Check if mutator managed to install a page while we were waiting to claim
+    ZPage* to_page = _forwarding->_prev
+      ? Atomic::load(&_forwarding->_to_snd)
+      : Atomic::load(&_forwarding->_to_fst);
+
+    // Abort if in-place is no longer needed -- wake up any blocking mutator
+    if (to_page) {
+      Atomic::store(&_forwarding->_ref_count, -Atomic::load(&_forwarding->_ref_count));
+       _forwarding->_ref_lock.notify_all();
+      return to_page; // not needed because the to-page should now be installed
+    }
+
+    _forwarding->in_place_relocation_start();
+
+    ZPage* prev_page = _forwarding->page();
+    ZPageAge new_age = _forwarding->to_age();
+    bool promotion = _forwarding->is_promotion();
+    // Promotions happen through a new cloned page
+    ZPage* new_page = promotion ? prev_page->clone_limited() : prev_page;
+    new_page->reset(new_age, ZPageResetType::InPlaceRelocation);
+
+    new_page->move_top_to_max();
+
+    if (promotion) {
+      // Register the the promotion
+      ZGeneration::young()->in_place_relocate_promote(prev_page, new_page);
+      ZGeneration::young()->register_in_place_relocate_promoted(prev_page);
+    }
+    _forwarding->_to_in_place = new_page;
+    return new_page;
+  }
+
+  void relocate_fragment(ZCompactForwardingEntry* entry) {
+    while (!try_relocate_fragment(entry, _target)) {
+      // Allocate a new target page, or if that fails, use the page being
+      // relocated as the new target, which will cause it to be relocated
+      // in-place.
+
+      // Start in-place relocation to block other threads from accessing
+      // the page, or its forwarding table, until it has been released
+      // (relocation completed).
+      _target = start_in_place_relocation();
+      assert(_target != NULL, "Bad target");
+      _allocator->inc_in_place_count();
+    }
+  }
+
+public:
+  ZCompactRelocateWork(Allocator* allocator, ZGeneration* generation) :
+      _allocator(allocator),
+      _forwarding(NULL),
+      _target(NULL),
+      _generation(generation),
+      _other_promoted(0),
+      _other_compacted(0) {}
+
+  ~ZCompactRelocateWork() {
+    _allocator->free_target_page(_target);
+    // Report statistics on-behalf of non-worker threads
+    _generation->increase_promoted(_other_promoted);
+    _generation->increase_compacted(_other_compacted);
+  }
+
+  void do_forwarding(ZCompactForwarding* forwarding) {
+    _forwarding = forwarding;
+    _target = NULL;
+
+    // Call versions that do not retain
+    bool in_place_fst = _forwarding->get_first(true /* gc_thread */) == NULL && _forwarding->_prev == NULL;
+    bool in_place_snd = _forwarding->has_snd_page() && _forwarding->get_second(true /* gc_thread */) == NULL;
+
+    if (in_place_fst && _forwarding->has_snd_page()) ShouldNotReachHere();
+    assert(!(in_place_fst && in_place_snd), "If we have two to-pages only snd page can be in place");
+
+    // Check if we should abort
+    if (ZAbort::should_abort()) {
+      _forwarding->abort_page();
+      return;
+    }
+
+    _forwarding->fragment_iterate([&](ZCompactForwardingEntry* entry) {
+      relocate_fragment(entry);
+    });
+
+    _generation->increase_freed(_forwarding->page()->size());
+
+    // Deal with in-place relocation
+    const bool in_place = _forwarding->in_place_relocation();
+    if (in_place) {
+      // We are done with the from_space copy of the page
+      _forwarding->in_place_relocation_finish();
+      _forwarding->install_to_page(_target);
+      _target = NULL;
+    }
+
+    // Release relocated page
+    _forwarding->release_page();
+
+    if (in_place) {
+      // CFW assumes that allocating a new page will give us a fresh page.
+      // Don't share it.
+    } else {
+      // Detach and free relocated page
+      ZPage* const page = _forwarding->detach_page();
+      ZHeap::heap()->free_page(page);
+    }
   }
 };
 
@@ -701,7 +1303,7 @@ private:
     return new_page;
   }
 
-  void relocate_object(oop obj) {
+  void compact_relocate_object(oop obj) {
     const zaddress addr = to_zaddress(obj);
     assert(ZHeap::heap()->is_object_live(addr), "Should be live");
 
@@ -747,12 +1349,7 @@ public:
     }
 
     // Relocate objects
-    _forwarding->object_iterate([&](oop obj) { relocate_object(obj); });
-
-    // Verify
-    if (ZVerifyForwarding) {
-      _forwarding->verify();
-    }
+    _forwarding->object_iterate([&](oop obj) { compact_relocate_object(obj); });
 
     _generation->increase_freed(_forwarding->page()->size());
 
@@ -804,6 +1401,82 @@ public:
   virtual void work() {
     ZRelocateStoreBufferInstallBasePointersThreadClosure fix_store_buffer_cl;
     _threads_iter.apply(&fix_store_buffer_cl);
+  }
+};
+
+class ZCompactRelocateTask : public ZRestartableTask {
+private:
+  ZCompactRelocationSetParallelIterator _iter;
+  ZGeneration* const             _generation;
+  ZCompactRelocateQueue* const          _queue;
+  ZRelocateSmallAllocator        _survivor_small_allocator;
+  ZRelocateMediumAllocator       _survivor_medium_allocator;
+  ZRelocateSmallAllocator        _old_small_allocator;
+  ZRelocateMediumAllocator       _old_medium_allocator;
+
+public:
+  ZCompactRelocateTask(ZCompactRelocationSet* relocation_set, ZCompactRelocateQueue* queue) :
+      ZRestartableTask("ZRelocateTask"),
+      _iter(relocation_set),
+      _generation(relocation_set->generation()),
+      _queue(queue),
+      _survivor_small_allocator(_generation, ZAllocator::survivor()),
+      _survivor_medium_allocator(_generation, ZAllocator::survivor()),
+      _old_small_allocator(_generation, ZAllocator::old()),
+      _old_medium_allocator(_generation, ZAllocator::old()) {}
+
+  ~ZCompactRelocateTask() {
+    _generation->stat_relocation()->at_relocate_end(_survivor_small_allocator.in_place_count() + _old_small_allocator.in_place_count(),
+                                                   _survivor_medium_allocator.in_place_count() + _old_medium_allocator.in_place_count());
+  }
+
+  virtual void work() {
+    ZCompactRelocateWork<ZRelocateSmallAllocator> survivor_small(&_survivor_small_allocator, _generation);
+    ZCompactRelocateWork<ZRelocateMediumAllocator> survivor_medium(&_survivor_medium_allocator, _generation);
+    ZCompactRelocateWork<ZRelocateSmallAllocator> old_small(&_old_small_allocator, _generation);
+    ZCompactRelocateWork<ZRelocateMediumAllocator> old_medium(&_old_medium_allocator, _generation);
+
+    bool synchronized = false;
+
+    const auto do_forwarding = [&](ZCompactForwarding* forwarding) {
+      ZPage* page = forwarding->page();
+      ZPageAge to_age = forwarding->_age_to;
+      if (page->is_small()) {
+        ZCompactRelocateWork<ZRelocateSmallAllocator>* small = to_age == ZPageAge::old ? &old_small : &survivor_small;
+        small->do_forwarding(forwarding);
+      } else {
+        ZCompactRelocateWork<ZRelocateMediumAllocator>* medium = to_age == ZPageAge::old ? &old_medium : &survivor_medium;
+        medium->do_forwarding(forwarding);
+      }
+    };
+
+    for (ZCompactForwarding* iter_forwarding; _iter.next(&iter_forwarding);) {
+      // Relocate page
+      if (iter_forwarding->is_first()) {
+        for (ZCompactForwarding *fw = iter_forwarding; fw;
+             fw = fw->_next) {
+          do_forwarding(fw);
+        }
+      }
+
+      // Prioritize relocation of pages other threads are waiting for
+      for (ZCompactForwarding* queue_forwarding; _queue->poll(&queue_forwarding, &synchronized);) {
+        while (queue_forwarding->_prev) {
+          queue_forwarding = queue_forwarding->_prev;
+        }
+        if (queue_forwarding->is_first())
+        for (ZCompactForwarding *fw = queue_forwarding; fw;
+             fw = fw->_next) {
+          do_forwarding(fw);
+        }
+      }
+    }
+
+    _queue->leave();
+  }
+
+  virtual void resize_workers(uint nworkers) {
+    _queue->join(nworkers);
   }
 };
 
@@ -935,26 +1608,37 @@ public:
   }
 };
 
+// Only called for young
 class ZRelocateAddRemsetForNormalPromoted : public ZRestartableTask {
 private:
-  ZStatTimerYoung                  _timer;
   ZForwardingTableParallelIterator _iter;
+  ZCompactForwardingTableParallelIterator _compact_iter;
+  ZStatTimerYoung                  _timer;
 
 public:
   ZRelocateAddRemsetForNormalPromoted() :
       ZRestartableTask("ZRelocateAddRemsetForNormalPromoted"),
-      _timer(ZSubPhaseConcurrentRelocateRememberedSetNormalPromotedYoung),
-      _iter(ZGeneration::young()->forwarding_table()) {}
+      _iter(ZGeneration::young()->forwarding_table()),
+      _compact_iter(ZGeneration::young()->compact_forwarding_table()),
+      _timer(ZSubPhaseConcurrentRelocateRememberedSetNormalPromotedYoung) {}
 
   virtual void work() {
     SuspendibleThreadSetJoiner sts_joiner;
+    if (ZGeneration::young()->use_hash_forwarding) {
+      _iter.do_forwardings([](ZForwarding* forwarding) {
+        forwarding->oops_do_in_forwarded_via_table(remap_and_maybe_add_remset);
 
-    _iter.do_forwardings([](ZForwarding* forwarding) {
-      forwarding->oops_do_in_forwarded_via_table(remap_and_maybe_add_remset);
+        SuspendibleThreadSet::yield();
+        return !ZGeneration::young()->should_worker_stop();
+      });
+    } else {
+      _compact_iter.do_forwardings([](ZCompactForwarding* forwarding) {
+        forwarding->oops_do_in_forwarded_via_table(remap_and_maybe_add_remset);
 
-      SuspendibleThreadSet::yield();
-      return !ZGeneration::young()->should_worker_stop();
-    });
+        SuspendibleThreadSet::yield();
+        return !ZGeneration::young()->should_worker_stop();
+      });
+    }
   }
 };
 
@@ -969,6 +1653,33 @@ void ZRelocate::relocate(ZRelocationSet* relocation_set) {
 
   {
     ZRelocateTask relocate_task(relocation_set, &_queue);
+    workers()->run(&relocate_task);
+  }
+
+  if (relocation_set->generation()->is_young()) {
+    ZRelocateAddRemsetForFlipPromoted task(relocation_set->flip_promoted_pages());
+    workers()->run(&task);
+  }
+
+  if (relocation_set->generation()->is_young() && ZRelocateRemsetStrategy == 2) {
+    ZRelocateAddRemsetForNormalPromoted task;
+    workers()->run(&task);
+  }
+
+  _queue.clear();
+}
+
+void ZRelocate::relocate(ZCompactRelocationSet* relocation_set) {
+  {
+    // Install the store buffer's base pointers before the
+    // relocate task destroys the liveness information in
+    // the relocated pages.
+    ZRelocateStoreBufferInstallBasePointersTask buffer_task;
+    workers()->run(&buffer_task);
+  }
+
+  {
+    ZCompactRelocateTask relocate_task(relocation_set, &_compact_queue);
     workers()->run(&relocate_task);
   }
 
@@ -1045,8 +1756,10 @@ void ZRelocate::flip_age_pages(const ZArray<ZPage*>* pages, bool promote_all) {
 
 void ZRelocate::synchronize() {
   _queue.synchronize();
+  _compact_queue.synchronize();
 }
 
 void ZRelocate::desynchronize() {
   _queue.desynchronize();
+  _compact_queue.desynchronize();
 }

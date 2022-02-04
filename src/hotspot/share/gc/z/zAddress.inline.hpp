@@ -441,7 +441,7 @@ inline bool ZPointer::is_load_good(zpointer ptr) {
   return !is_load_bad(ptr) && !is_null(ptr);
 }
 
-inline bool ZPointer::is_load_good_or_null(zpointer ptr) {
+inline bool ZPointer::is_load_good_or_null(zpointer ptr, bool assert_valid) {
   // Checking if an address is "not bad" is an optimized version of
   // checking if it's "good or null", which eliminates an explicit
   // null check. However, the implicit null check only checks that
@@ -450,7 +450,9 @@ inline bool ZPointer::is_load_good_or_null(zpointer ptr) {
   // the barrier as if it was null. This should be harmless as such
   // addresses should ever be passed through the barrier.
   const bool result = !is_load_bad(ptr);
-  assert((is_load_good(ptr) || is_null(ptr)) == result, "Bad address");
+  if (assert_valid) {
+    assert((is_load_good(ptr) || is_null(ptr)) == result, "Bad address");
+  }
   return result;
 }
 

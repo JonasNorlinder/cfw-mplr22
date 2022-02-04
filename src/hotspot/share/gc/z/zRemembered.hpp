@@ -27,7 +27,7 @@
 #include "gc/z/zAddress.hpp"
 
 class OopClosure;
-class ZForwarding;
+class ZCompactForwarding;
 class ZPageTable;
 struct ZRememberedSetContaining;
 template <typename T> class GrowableArrayView;
@@ -41,6 +41,8 @@ private:
   ZPageAllocator* const _page_allocator;
 
   template <typename Function>
+  void oops_do_forwarded(ZCompactForwarding* forwarding, Function function) const;
+  template <typename Function>
   void oops_do_forwarded(ZForwarding* forwarding, Function function) const;
 
   template <typename Function>
@@ -49,6 +51,7 @@ private:
   bool should_scan_page(ZPage* page) const;
 
   void scan_page(ZPage* page) const;
+  void scan_forwarding(ZCompactForwarding* forwarding, void* context) const;
   void scan_forwarding(ZForwarding* forwarding, void* context) const;
 
 public:

@@ -24,6 +24,7 @@
 #include "precompiled.hpp"
 #include "gc/shared/gc_globals.hpp"
 #include "gc/z/zArray.inline.hpp"
+#include "gc/z/zGeneration.inline.hpp"
 #include "gc/z/zForwarding.inline.hpp"
 #include "gc/z/zPage.inline.hpp"
 #include "gc/z/zRelocationSetSelector.inline.hpp"
@@ -52,7 +53,9 @@ ZRelocationSetSelectorGroup::ZRelocationSetSelectorGroup(const char* name,
     _live_pages(),
     _not_selected_pages(),
     _forwarding_entries(0),
-    _stats() {}
+    _stats(),
+    _forwarding_overhead(0),
+    _compact_forwarding_overhead(0) {}
 
 bool ZRelocationSetSelectorGroup::is_disabled() {
   // Medium pages are disabled when their page size is zero
@@ -112,11 +115,14 @@ void ZRelocationSetSelectorGroup::select_inner() {
   const int npages = _live_pages.length();
   int selected_from = 0;
   int selected_to = 0;
+  size_t selected_live_objects = 0;
   size_t selected_live_bytes = 0;
   size_t selected_forwarding_entries = 0;
+  size_t selected_compact_forwarding_entries = 0;
 
   size_t from_live_bytes = 0;
   size_t from_forwarding_entries = 0;
+  size_t from_forwarding_entries_compact = 0;
 
   semi_sort();
 
@@ -124,7 +130,10 @@ void ZRelocationSetSelectorGroup::select_inner() {
     // Add page to the candidate relocation set
     ZPage* const page = _live_pages.at(from - 1);
     from_live_bytes += page->live_bytes();
+    // CFW:        page->live objects()
+    // Hash table: round_up_power_of_2(page->live_objects() * 2)
     from_forwarding_entries += ZForwarding::nentries(page);
+    from_forwarding_entries_compact += ZCompactForwarding::nentries(page);
 
     // Calculate the maximum number of pages needed by the candidate relocation set.
     // By subtracting the object size limit from the pages size we get the maximum
@@ -144,6 +153,7 @@ void ZRelocationSetSelectorGroup::select_inner() {
       selected_to = to;
       selected_live_bytes = from_live_bytes;
       selected_forwarding_entries = from_forwarding_entries;
+      selected_compact_forwarding_entries = from_forwarding_entries_compact;
     }
 
     log_trace(gc, reloc)("Candidate Relocation Set (%s Pages): %d->%d, "
@@ -160,13 +170,34 @@ void ZRelocationSetSelectorGroup::select_inner() {
     }
   }
   _live_pages.trunc_to(selected_from);
-  _forwarding_entries = selected_forwarding_entries;
+  _forwarding_entries = selected_forwarding_entries; // round_up_power_of_2(page->live_objects() * 2)
+  _compact_forwarding_entries = selected_compact_forwarding_entries; // live_objects
 
   // Update statistics
   _stats._relocate = selected_live_bytes;
 
+  // Update forwarding overhead
+  size_t selected_pages = _live_pages.length();
+  size_t entries_needed = selected_forwarding_entries;
+  size_t nentries = _page_type == ZPageType::small ? (ZPageSizeSmall/256+1) * selected_pages : (ZPageSizeMedium/256+1) * selected_pages;
+  size_t size_forwardings = selected_pages * sizeof(ZCompactForwarding*) + selected_pages * sizeof(ZCompactForwarding);
+  size_t size_compact_entries = nentries * sizeof(ZCompactForwardingEntry);
+  _compact_forwarding_overhead = size_forwardings + size_compact_entries;
+
+  const size_t relocation_set_size = selected_pages * sizeof(ZForwarding*);
+  const size_t forwardings_size = selected_pages * sizeof(ZForwarding);
+  const size_t forwarding_entries_size = entries_needed * sizeof(ZForwardingEntry);
+  _forwarding_overhead = relocation_set_size + forwardings_size + forwarding_entries_size;
+
   log_trace(gc, reloc)("Relocation Set (%s Pages): %d->%d, %d skipped, " SIZE_FORMAT " forwarding entries",
                        _name, selected_from, selected_to, npages - selected_from, selected_forwarding_entries);
+}
+
+const size_t ZRelocationSetSelectorGroup::forwarding_overhead() const {
+  return _forwarding_overhead;
+}
+const size_t ZRelocationSetSelectorGroup::compact_forwarding_overhead() const {
+  return _compact_forwarding_overhead;
 }
 
 void ZRelocationSetSelectorGroup::select() {
@@ -191,12 +222,13 @@ void ZRelocationSetSelectorGroup::select() {
   event.commit((u8)_page_type, _stats.npages(), _stats.total(), _stats.empty(), _stats.relocate());
 }
 
-ZRelocationSetSelector::ZRelocationSetSelector(bool promote_all) :
+ZRelocationSetSelector::ZRelocationSetSelector(bool promote_all, ZGeneration* generation) :
     _small("Small", ZPageType::small, ZPageSizeSmall, ZObjectSizeLimitSmall),
     _medium("Medium", ZPageType::medium, ZPageSizeMedium, ZObjectSizeLimitMedium),
     _large("Large", ZPageType::large, 0 /* page_size */, 0 /* object_size_limit */),
     _empty_pages(),
-    _promote_all(promote_all) {}
+    _promote_all(promote_all),
+    _generation(generation) {}
 
 void ZRelocationSetSelector::select() {
   // Select pages to relocate. The resulting relocation set will be
@@ -211,6 +243,17 @@ void ZRelocationSetSelector::select() {
   _large.select();
   _medium.select();
   _small.select();
+
+  size_t memory_overhead  = _medium.forwarding_overhead() + _small.forwarding_overhead();
+  double oh = (double)memory_overhead / MaxHeapSize;
+  // ZMaxOffHeap == 0   => All will be compact
+  // ZMaxOffHeap == 100 => All will be hash table
+  // so ZMaxOffHeap == 3.5 will run compact if overhead is more than 3.5% of Java heap
+  if (ZMaxOffHeap == 0 || oh > (ZMaxOffHeap/100) && ZMaxOffHeap != 100) {
+   _generation->use_hash_forwarding = false;
+  } else {
+   _generation->use_hash_forwarding = true;
+  }
 
   // Send event
   event.commit(total(), empty(), relocate());

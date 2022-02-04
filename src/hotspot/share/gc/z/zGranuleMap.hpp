@@ -32,8 +32,10 @@ template <typename T>
 class ZGranuleMap {
   friend class VMStructs;
   template <typename, bool> friend class ZGranuleMapIterator;
+  friend class ZCompactForwardingTable;
   friend class ZForwardingTable;
   friend class ZPageTable;
+  friend class ZCompactForwardingTableParallelIterator;
   friend class ZForwardingTableParallelIterator;
   friend class ZOldGenerationPagesSafeIterator;
 

@@ -52,6 +52,7 @@ class ZPage : public CHeapObj<mtGC> {
   friend class VMStructs;
   friend class ZList<ZPage>;
   friend class ZForwardingTest;
+  friend class ZCompactForwarding;
 
 private:
   ZPageType        _type;
@@ -87,6 +88,14 @@ private:
   ZPage* split_with_pmem(ZPageType type, const ZPhysicalMemory& pmem);
 
 public:
+  void set_top(size_t bytes) {
+    _top = (zoffset)((size_t)start() + bytes);
+  }
+  void move_top_to_max() {
+    _top = zoffset((uintptr_t)start() + size());
+    assert(remaining() == 0, "");
+  }
+
   ZPage(ZPageType type, const ZVirtualMemory& vmem, const ZPhysicalMemory& pmem);
   ~ZPage();
 

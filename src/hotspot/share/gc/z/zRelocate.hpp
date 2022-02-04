@@ -27,9 +27,38 @@
 #include "gc/z/zRelocationSet.hpp"
 #include "gc/z/zPageAge.hpp"
 
-class ZForwarding;
+class ZCompactForwarding;
 class ZGeneration;
 class ZWorkers;
+
+class ZCompactRelocateQueue {
+private:
+  ZConditionLock       _lock;
+  ZArray<ZCompactForwarding*> _queue;
+  uint                 _nworkers;
+  uint                 _nsynchronized;
+  bool                 _synchronize;
+  volatile int         _needs_attention;
+
+  bool needs_attention() const;
+  void inc_needs_attention();
+  void dec_needs_attention();
+
+public:
+  ZCompactRelocateQueue();
+
+  void join(uint nworkers);
+  void leave();
+
+  void add(ZCompactForwarding* forwarding);
+
+  bool poll(ZCompactForwarding** forwarding, bool* synchronized);
+  void clear();
+
+  void synchronize();
+  void desynchronize();
+};
+
 
 class ZRelocateQueue {
 private:
@@ -51,6 +80,7 @@ public:
   void leave();
 
   void add(ZForwarding* forwarding);
+
   bool poll(ZForwarding** forwarding, bool* synchronized);
   void clear();
 
@@ -59,28 +89,35 @@ public:
 };
 
 class ZRelocate {
+  friend class ZCompactRelocateTask;
   friend class ZRelocateTask;
 
 private:
   ZGeneration* const _generation;
   ZRelocateQueue     _queue;
+  ZCompactRelocateQueue     _compact_queue;
 
   ZWorkers* workers() const;
-  void work(ZRelocationSetParallelIterator* iter);
+  //void work(ZCompactRelocationSetParallelIterator* iter); not needed?
+  //void work(ZRelocationSetParallelIterator* iter);
 
 public:
   ZRelocate(ZGeneration* generation);
 
   void start();
+  void start_compact();
 
   static void add_remset(volatile zpointer* p);
   static void add_remset_for_fields(volatile zaddress addr);
 
   static ZPageAge compute_to_age(ZPageAge from_age, bool promote_all);
 
+  zaddress compact_relocate_object(ZCompactForwarding* forwarding, zaddress_unsafe from_addr);
+  zaddress compact_forward_object(ZCompactForwarding* forwarding, zaddress_unsafe from_addr);
   zaddress relocate_object(ZForwarding* forwarding, zaddress_unsafe from_addr);
   zaddress forward_object(ZForwarding* forwarding, zaddress_unsafe from_addr);
 
+  void relocate(ZCompactRelocationSet* relocation_set);
   void relocate(ZRelocationSet* relocation_set);
 
   void flip_age_pages(const ZArray<ZPage*>* pages, bool promote_all);

@@ -88,15 +88,32 @@ void ZStoreBarrierBuffer::install_base_pointers_inner() {
     // Look up the generation that thinks that this pointer is not
     // load good and check if the page is being relocated.
     ZGeneration* const remap_generation = ZBarrier::remap_generation(ptr);
-    ZForwarding* const forwarding = remap_generation->forwarding(p_unsafe);
-    if (forwarding != NULL) {
-      // Page is being relocated
-      ZPage* const page = forwarding->page();
-      _base_pointers[i] = page->find_base(p);
+
+    // Because of the complex logic for suppporting a forwarding table in both
+    // generations we will always look in compact and hash table to be sure.
+    // Maybe we can reduce this to checking the global flag.
+    if (remap_generation->use_hash_forwarding) {
+      ZForwarding* const forwarding = remap_generation->forwarding(p_unsafe);
+      if (forwarding != NULL) {
+        // Page is being relocated
+        ZPage* const page = forwarding->page();
+        _base_pointers[i] = page->find_base(p);
+      } else {
+        // Page is not being relocated
+        _base_pointers[i] = zaddress_unsafe::null;
+      }
     } else {
-      // Page is not being relocated
-      _base_pointers[i] = zaddress_unsafe::null;
+      ZCompactForwarding* const compact_forwarding = remap_generation->compact_forwarding(p_unsafe);
+      if (compact_forwarding != NULL) {
+        // Page is being relocated
+        ZPage* const page = compact_forwarding->page();
+        _base_pointers[i] = page->find_base(p);
+      } else {
+        // Page is not being relocated
+        _base_pointers[i] = zaddress_unsafe::null;
+      }
     }
+
   }
 }
 

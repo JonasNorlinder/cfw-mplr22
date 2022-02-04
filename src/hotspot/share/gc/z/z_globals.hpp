@@ -38,6 +38,9 @@
   product(double, ZFragmentationLimit, 25.0,                                \
           "Maximum allowed heap fragmentation")                             \
                                                                             \
+  product(double, ZMaxOffHeap, 4.0,                                         \
+          "Maximum off heap usage for forwarding information")              \
+                                                                            \
   product(size_t, ZMarkStackSpaceLimit, 8*G,                                \
           "Maximum number of bytes allocated for mark stacks")              \
           range(32*M, 1024*G)                                               \
@@ -96,9 +99,6 @@
                                                                             \
   product(bool, ZVerifyMarking, trueInDebug, DIAGNOSTIC,                    \
           "Verify marking stacks")                                          \
-                                                                            \
-  product(bool, ZVerifyForwarding, false, DIAGNOSTIC,                       \
-          "Verify forwarding tables")
 
 // end of GC_Z_FLAGS
 

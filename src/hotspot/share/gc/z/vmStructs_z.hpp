@@ -57,10 +57,9 @@ public:
   const int* _ZObjectAlignmentSmallShift;
   const int* _ZObjectAlignmentSmall;
 };
-
+// TODO Update this file for compact forwardings
 typedef ZGranuleMap<ZPage*> ZGranuleMapForPageTable;
-typedef ZGranuleMap<ZForwarding*> ZGranuleMapForForwarding;
-typedef ZAttachedArray<ZForwarding, ZForwardingEntry> ZAttachedArrayForForwarding;
+typedef ZAttachedArray<ZCompactForwarding, ZCompactForwardingEntry> ZAttachedArrayForForwarding;
 
 #define VM_STRUCTS_ZGC(nonstatic_field, volatile_nonstatic_field, static_field)                      \
   static_field(ZGlobalsForVMStructs,            _instance_p,          ZGlobalsForVMStructs*)         \
@@ -93,18 +92,13 @@ typedef ZAttachedArray<ZForwarding, ZForwardingEntry> ZAttachedArrayForForwardin
   nonstatic_field(ZPageTable,                   _map,                 ZGranuleMapForPageTable)       \
                                                                                                      \
   nonstatic_field(ZGranuleMapForPageTable,      _map,                 ZPage** const)                 \
-  nonstatic_field(ZGranuleMapForForwarding,     _map,                 ZForwarding** const)           \
-                                                                                                     \
-  nonstatic_field(ZForwardingTable,             _map,                 ZGranuleMapForForwarding)      \
                                                                                                      \
   nonstatic_field(ZVirtualMemory,               _start,               const zoffset)                 \
   nonstatic_field(ZVirtualMemory,               _end,                 const zoffset_end)             \
                                                                                                      \
-  nonstatic_field(ZForwarding,                  _virtual,             const ZVirtualMemory)          \
-  nonstatic_field(ZForwarding,                  _object_alignment_shift, const size_t)               \
-  volatile_nonstatic_field(ZForwarding,         _ref_count,           int)                           \
-  nonstatic_field(ZForwarding,                  _entries,             const ZAttachedArrayForForwarding) \
-  nonstatic_field(ZForwardingEntry,             _entry,               uint64_t)                      \
+  nonstatic_field(ZCompactForwarding,                  _virtual,             const ZVirtualMemory)          \
+  nonstatic_field(ZCompactForwarding,                  _object_alignment_shift, const size_t)               \
+  volatile_nonstatic_field(ZCompactForwarding,         _ref_count,           int)                           \
   nonstatic_field(ZAttachedArrayForForwarding,  _length,              const size_t)
 
 #define VM_INT_CONSTANTS_ZGC(declare_constant, declare_constant_with_value)                          \
@@ -137,11 +131,10 @@ typedef ZAttachedArray<ZForwarding, ZForwardingEntry> ZAttachedArrayForForwardin
   declare_toplevel_type(ZPageTable)                                                                  \
   declare_toplevel_type(ZAttachedArrayForForwarding)                                                 \
   declare_toplevel_type(ZGranuleMapForPageTable)                                                     \
-  declare_toplevel_type(ZGranuleMapForForwarding)                                                    \
   declare_toplevel_type(ZVirtualMemory)                                                              \
-  declare_toplevel_type(ZForwardingTable)                                                            \
-  declare_toplevel_type(ZForwarding)                                                                 \
-  declare_toplevel_type(ZForwardingEntry)                                                            \
+  declare_toplevel_type(ZCompactForwardingTable)                                                            \
+  declare_toplevel_type(ZCompactForwarding)                                                                 \
+  declare_toplevel_type(ZCompactForwardingEntry)                                                            \
   declare_toplevel_type(ZPhysicalMemoryManager)
 
 #endif // SHARE_GC_Z_VMSTRUCTS_Z_HPP

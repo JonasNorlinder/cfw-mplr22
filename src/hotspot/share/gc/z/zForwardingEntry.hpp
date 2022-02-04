@@ -24,27 +24,62 @@
 #ifndef SHARE_GC_Z_ZFORWARDINGENTRY_HPP
 #define SHARE_GC_Z_ZFORWARDINGENTRY_HPP
 
+#include "gc/z/zLock.hpp"
+#include "gc/z/zAddress.inline.hpp"
 #include "gc/z/zBitField.hpp"
 #include "memory/allocation.hpp"
 #include "metaprogramming/primitiveConversions.hpp"
 #include <type_traits>
 
-//
-// Forwarding entry layout
-// -----------------------
-//
-//   6                  4 4
-//   3                  6 5                                                1 0
-//  +--------------------+--------------------------------------------------+-+
-//  |11111111 11111111 11|111111 11111111 11111111 11111111 11111111 1111111|1|
-//  +--------------------+--------------------------------------------------+-+
-//  |                    |                                                  |
-//  |                    |                      0-0 Populated Flag (1-bits) *
-//  |                    |
-//  |                    * 45-1 To Object Offset (45-bits)
-//  |
-//  * 63-46 From Object Index (18-bits)
-//
+class ZCompactForwarding;
+
+enum class ZEntryStatus : uint8_t {
+  locked,
+  relocated
+};
+
+/// FIXME: move to another file
+class ZCompactForwardingEntry {
+  friend class ZCompactForwarding;
+private:
+  typedef ZBitField<uint64_t, uint32_t, 0, 32>     field_live_bits;
+  typedef ZBitField<uint64_t, uint32_t, 32, 30>    field_live_bytes;
+  typedef ZBitField<uint64_t, bool, 62, 1>         field_locked;
+  typedef ZBitField<uint64_t, bool, 63, 1>         field_relocated;
+
+  uint64_t _entry;
+
+  void set_relocated() {
+    _entry |= 1ULL<< 63;
+  }
+
+public:
+  ZCompactForwardingEntry() :
+    _entry(0) {}
+
+  // Liveness and size bits describes one fragment
+  void set_liveness(size_t index);
+  void set_size_bit(size_t index, size_t size);
+
+  int32_t move_cursor(int32_t cursor, bool count) const;
+  int32_t get_next_live_object(int32_t cursor, bool count) const;
+
+  uint32_t live_bytes_before_fragment() const;
+  void set_live_bytes_before_fragment(size_t value);
+
+  const size_t get_size(int32_t cursor) const;
+  const int32_t last_live() const;
+  const size_t live_bytes_on_fragment(uintptr_t old_page, uintptr_t from_offset, const ZCompactForwarding* fw) const;
+
+  void mark_as_relocated();
+  bool is_relocated() const;
+  const ZEntryStatus wait_until_locked_or_relocated();
+  void lock();
+  void unlock();
+  void unlock_and_mark_relocated();
+};
+
+
 
 class ZForwardingEntry {
   friend struct PrimitiveConversions::Translate<ZForwardingEntry>;

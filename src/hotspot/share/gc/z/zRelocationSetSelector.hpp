@@ -29,7 +29,9 @@
 #include "gc/z/zPageType.hpp"
 #include "memory/allocation.hpp"
 
+
 class ZPage;
+typedef uint32_t (*fun_nentires)(const ZPage* page);
 
 class ZRelocationSetSelectorGroupStats {
   friend class ZRelocationSetSelectorGroup;
@@ -75,11 +77,15 @@ private:
   ZArray<ZPage*>                   _live_pages;
   ZArray<ZPage*>                   _not_selected_pages;
   size_t                           _forwarding_entries;
+  size_t                           _compact_forwarding_entries;
   ZRelocationSetSelectorGroupStats _stats;
+  size_t                           _forwarding_overhead;
+  size_t                           _compact_forwarding_overhead;
 
   bool is_disabled();
   bool is_selectable();
   void semi_sort();
+
   void select_inner();
 
 public:
@@ -96,10 +102,14 @@ public:
   const ZArray<ZPage*>* selected_pages() const;
   const ZArray<ZPage*>* not_selected_pages() const;
   size_t forwarding_entries() const;
+  size_t compact_forwarding_entries() const;
 
   const ZRelocationSetSelectorGroupStats& stats() const;
-};
 
+  const size_t forwarding_overhead() const;
+  const size_t compact_forwarding_overhead() const;
+};
+class ZGeneration;
 class ZRelocationSetSelector : public StackObj {
 private:
   ZRelocationSetSelectorGroup _small;
@@ -107,13 +117,14 @@ private:
   ZRelocationSetSelectorGroup _large;
   ZArray<ZPage*>              _empty_pages;
   const bool                  _promote_all;
+  ZGeneration*           _generation;
 
   size_t total() const;
   size_t empty() const;
   size_t relocate() const;
 
 public:
-  ZRelocationSetSelector(bool promote_all);
+  ZRelocationSetSelector(bool promote_all, ZGeneration* generation);
 
   void register_live_page(ZPage* page);
   void register_empty_page(ZPage* page);
@@ -133,6 +144,7 @@ public:
   const ZArray<ZPage*>* not_selected_medium() const;
   const ZArray<ZPage*>* not_selected_large() const;
   size_t forwarding_entries() const;
+  size_t compact_forwarding_entries() const;
 
   ZRelocationSetSelectorStats stats() const;
 };

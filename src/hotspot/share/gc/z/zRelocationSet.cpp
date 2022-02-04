@@ -36,6 +36,193 @@
 #include "runtime/atomic.hpp"
 #include "utilities/debug.hpp"
 
+class ZCompactRelocationSetInstallTask : public ZTask {
+private:
+  ZForwardingAllocator* const    _allocator;
+  ZCompactForwarding**                  _forwardings;
+  const size_t                   _nforwardings;
+  const bool                     _promote_all;
+  ZArrayParallelIterator<ZPage*> _small_iter;
+  ZArrayParallelIterator<ZPage*> _medium_iter;
+  volatile size_t                _small_next;
+  volatile size_t                _medium_next;
+
+  void install(ZCompactForwarding* forwarding, volatile size_t* next) {
+    const size_t index = Atomic::fetch_and_add(next, 1u);
+    assert(index < _nforwardings, "Invalid index");
+
+    forwarding->page()->log_msg(" (relocation selected)");
+
+    _forwardings[index] = forwarding;
+  }
+
+  void install_small(ZCompactForwarding* forwarding) {
+    install(forwarding, &_small_next);
+  }
+
+  void install_medium(ZCompactForwarding* forwarding) {
+    install(forwarding, &_medium_next);
+  }
+
+  ZPageAge to_age(ZPage* page) {
+    return ZRelocate::compute_to_age(page->age(), _promote_all);
+  }
+
+public:
+  ZCompactRelocationSetInstallTask(ZForwardingAllocator* allocator, const ZRelocationSetSelector* selector) :
+      ZTask("ZRelocationSetInstallTask"),
+      _allocator(allocator),
+      _forwardings(NULL),
+      _nforwardings(selector->selected_small()->length() + selector->selected_medium()->length()),
+      _promote_all(selector->promote_all()),
+      _small_iter(selector->selected_small()),
+      _medium_iter(selector->selected_medium()),
+      _small_next(selector->selected_medium()->length()),
+      _medium_next(0) {
+    const size_t relocation_set_size = _nforwardings * sizeof(ZCompactForwarding*);
+    _allocator->reset(relocation_set_size);
+
+    // Allocate relocation set
+    _forwardings = new (_allocator->alloc(relocation_set_size)) ZCompactForwarding*[_nforwardings];
+  }
+
+  ~ZCompactRelocationSetInstallTask() {
+    assert(_allocator->is_full(), "Should be full");
+  }
+
+  static ZPageAge compute_age_to(ZPageAge age_from, bool promote_all) {
+    if (promote_all) {
+      return ZPageAge::old;
+    } else if (age_from == ZPageAge::eden) {
+      return ZPageAge::survivor;
+    } else {
+      return ZPageAge::old;
+    }
+  }
+
+  // Note: this logic is not changed -- simply cleaned up
+  virtual void work() {
+    // FIXME: link *all* ZForwarding's together (now one per task!)
+    // TODO: track which FW is *last* and don't have that one MAX top
+    bool promote_all = true; // TODO FIX OLD LOGIC: ZCollectedHeap::heap()->_driver_major->promote_all
+
+    // Allocate and install forwardings for small pages
+    ZCompactForwarding *small_fw_chain[3] = {};
+
+    for (ZPage* page; _small_iter.next(&page);) {
+      ZCompactForwarding* cfw = (ZCompactForwarding*)calloc(sizeof(ZCompactForwarding), 1);
+      ZPageAge age = to_age(page);
+      int chain_index = (uint8_t) age;
+
+      ZCompactForwarding* forwarding = ::new (cfw) ZCompactForwarding(page, age == ZPageAge::old, small_fw_chain[chain_index]);
+      install_small(forwarding);
+      small_fw_chain[chain_index] = forwarding;
+    }
+
+    for (int i = 0; i < 2; ++i) {
+      if (small_fw_chain[i]) small_fw_chain[i]->mark_as_last();
+    }
+
+    // Allocate and install forwardings for medium pages
+    ZCompactForwarding *medium_fw_chain[3] = {};
+
+    for (ZPage* page; _medium_iter.next(&page);) {
+      ZCompactForwarding* cfw = (ZCompactForwarding*)calloc(sizeof(ZCompactForwarding), 1);
+      ZPageAge age = to_age(page);
+      int chain_index = (uint8_t) age;
+
+      ZCompactForwarding* forwarding = ::new (cfw) ZCompactForwarding(page, age == ZPageAge::old, medium_fw_chain[chain_index]);
+      install_medium(forwarding);
+      medium_fw_chain[chain_index] = forwarding;
+    }
+
+    for (int i = 0; i < 2; ++i) {
+      if (medium_fw_chain[i]) medium_fw_chain[i]->mark_as_last();
+    }
+  }
+
+  ZCompactForwarding** forwardings() const {
+    return _forwardings;
+  }
+
+  size_t nforwardings() const {
+    return _nforwardings;
+  }
+};
+
+ZCompactRelocationSet::ZCompactRelocationSet(ZGeneration* generation) :
+    _generation(generation),
+    _allocator(),
+    _forwardings(NULL),
+    _nforwardings(0),
+    _promotion_lock(),
+    _flip_promoted_pages(),
+    _in_place_relocate_promoted_pages() {}
+
+ZWorkers* ZCompactRelocationSet::workers() const {
+  return _generation->workers();
+}
+
+ZGeneration* ZCompactRelocationSet::generation() const {
+  return _generation;
+}
+
+ZArray<ZPage*>* ZCompactRelocationSet::flip_promoted_pages() {
+  return &_flip_promoted_pages;
+}
+
+void ZCompactRelocationSet::install(const ZRelocationSetSelector* selector) {
+  // Install relocation set
+  ZCompactRelocationSetInstallTask task(&_allocator, selector);
+  workers()->run(&task);
+
+  _forwardings = task.forwardings();
+  _nforwardings = task.nforwardings();
+
+  // Update statistics
+  size_t nsmall = selector->selected_small()->length();
+  size_t nmedium = selector->selected_medium()->length();
+  size_t nentries = (ZPageSizeSmall/256+1)*nsmall+(ZPageSizeMedium/256+1)*nmedium;
+  size_t size_forwardings = _nforwardings * sizeof(ZCompactForwarding*) + _nforwardings * sizeof(ZCompactForwarding);
+  size_t size_compact_entries = nentries * sizeof(ZCompactForwardingEntry);
+  _generation->stat_relocation()->at_install_relocation_set(size_forwardings + size_compact_entries);
+}
+
+static void destroy_and_clear(ZPageAllocator* page_allocator, ZArray<ZPage*>* array) {
+  for (int i = 0; i < array->length(); i++) {
+    // Delete non-relocating promoted pages from last cycle
+    ZPage* page = array->at(i);
+    page_allocator->safe_destroy_page(page);
+  }
+  array->clear();
+}
+void ZCompactRelocationSet::reset(ZPageAllocator* page_allocator) {
+  // Destroy forwardings
+  ZCompactRelocationSetIterator iter(this);
+  for (ZCompactForwarding* forwarding; iter.next(&forwarding);) {
+    forwarding->~ZCompactForwarding();
+  }
+
+  _nforwardings = 0;
+
+  destroy_and_clear(page_allocator, &_in_place_relocate_promoted_pages);
+  destroy_and_clear(page_allocator, &_flip_promoted_pages);
+}
+
+void ZCompactRelocationSet::register_flip_promoted(const ZArray<ZPage*>& pages) {
+  ZLocker<ZLock> locker(&_promotion_lock);
+  for (ZPage* page : pages) {
+    assert(!_flip_promoted_pages.contains(page), "no duplicates allowed");
+    _flip_promoted_pages.append(page);
+  }
+}
+
+void ZCompactRelocationSet::register_in_place_relocate_promoted(ZPage* page) {
+  ZLocker<ZLock> locker(&_promotion_lock);
+  assert(!_in_place_relocate_promoted_pages.contains(page), "no duplicates allowed");
+  _in_place_relocate_promoted_pages.append(page);
+}
+
 class ZRelocationSetInstallTask : public ZTask {
 private:
   ZForwardingAllocator* const    _allocator;
@@ -92,7 +279,7 @@ public:
   }
 
   ~ZRelocationSetInstallTask() {
-    assert(_allocator->is_full(), "Should be full");
+    //assert(_allocator->is_full(), "Should be full");
   }
 
   virtual void work() {
@@ -151,7 +338,7 @@ void ZRelocationSet::install(const ZRelocationSetSelector* selector) {
   _generation->stat_relocation()->at_install_relocation_set(_allocator.size());
 }
 
-static void destroy_and_clear(ZPageAllocator* page_allocator, ZArray<ZPage*>* array) {
+static void destroy_and_clear_vanilla(ZPageAllocator* page_allocator, ZArray<ZPage*>* array) {
   for (int i = 0; i < array->length(); i++) {
     // Delete non-relocating promoted pages from last cycle
     ZPage* page = array->at(i);
@@ -168,8 +355,8 @@ void ZRelocationSet::reset(ZPageAllocator* page_allocator) {
 
   _nforwardings = 0;
 
-  destroy_and_clear(page_allocator, &_in_place_relocate_promoted_pages);
-  destroy_and_clear(page_allocator, &_flip_promoted_pages);
+  destroy_and_clear_vanilla(page_allocator, &_in_place_relocate_promoted_pages);
+  destroy_and_clear_vanilla(page_allocator, &_flip_promoted_pages);
 }
 
 void ZRelocationSet::register_flip_promoted(const ZArray<ZPage*>& pages) {

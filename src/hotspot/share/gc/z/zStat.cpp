@@ -1390,7 +1390,6 @@ void ZStatRelocation::print() {
   }
   print("Large", _selector_stats.large(), 0 /* in_place_count */);
 
-  // Forwarding calc:  _nforwardings * sizeof(ZForwarding*) + _nforwardings * sizeof(ZForwarding) + (_small.forwarding_entries() + _medium.forwarding_entries()) * sizeof(ZForwardingEntry)
   log_info(gc, reloc)("Forwarding Usage: " SIZE_FORMAT "B", _forwarding_usage);
 }
 
@@ -1599,6 +1598,10 @@ size_t ZStatHeap::used_at_collection_end() const {
 }
 
 void ZStatHeap::print(const ZGeneration* generation) const {
+  const char* strategy = generation->use_hash_forwarding ? "hash table" : "compact";
+  const char* g = generation->is_young() ? "young" : "old";
+  log_info(gc, reloc)("Forwarding Strategy: %s (%s)", strategy, g);
+
   log_info(gc, heap)("Min Capacity: "
                      ZSIZE_FMT, ZSIZE_ARGS(_at_initialize.min_capacity));
   log_info(gc, heap)("Max Capacity: "

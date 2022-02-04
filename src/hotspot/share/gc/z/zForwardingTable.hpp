@@ -27,7 +27,39 @@
 #include "gc/z/zGranuleMap.hpp"
 #include "gc/z/zIndexDistributor.hpp"
 
+class ZCompactForwarding;
 class ZForwarding;
+
+class ZCompactForwardingTable {
+  friend class VMStructs;
+  friend class ZOldGenerationPagesSafeIterator;
+  friend class ZCompactForwardingTableParallelIterator;
+
+private:
+  ZGranuleMap<ZCompactForwarding*> _map;
+
+  ZCompactForwarding* at(size_t index) const;
+
+public:
+  ZCompactForwardingTable();
+
+  ZCompactForwarding* get(zaddress_unsafe addr) const;
+
+  void insert(ZCompactForwarding* forwarding);
+  void remove(ZCompactForwarding* forwarding);
+};
+
+class ZCompactForwardingTableParallelIterator : public StackObj {
+private:
+  const ZCompactForwardingTable* _table;
+  ZIndexDistributor       _index_distributor;
+
+public:
+  ZCompactForwardingTableParallelIterator(const ZCompactForwardingTable* table);
+
+  template <typename Function>
+  void do_forwardings(Function function);
+};
 
 class ZForwardingTable {
   friend class VMStructs;

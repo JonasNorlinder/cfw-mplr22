@@ -198,8 +198,9 @@ inline ZGeneration* ZBarrier::remap_generation(zpointer ptr) {
   }
 
   const zaddress_unsafe addr = ZPointer::uncolor_unsafe(ptr);
-  if (ZGeneration::young()->forwarding(addr) != NULL) {
-    assert(ZGeneration::old()->forwarding(addr) == NULL, "Mutually exclusive");
+  void* fw = ZGeneration::young()->use_hash_forwarding ? (void*)ZGeneration::young()->forwarding(addr): (void*)ZGeneration::young()->compact_forwarding(addr);
+
+  if (fw != NULL) {
     return ZGeneration::young();
   } else {
     return ZGeneration::old();

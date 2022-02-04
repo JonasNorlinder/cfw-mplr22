@@ -83,6 +83,13 @@ void ZRemembered::oops_do_forwarded_via_containing(GrowableArrayView<ZRemembered
 }
 
 template <typename Function>
+void ZRemembered::oops_do_forwarded(ZCompactForwarding* forwarding, Function function) const {
+  // All objects have been forwarded, and the page could have been detached.
+  // Visit all objects via the forwarding table.
+  forwarding->oops_do_in_forwarded_via_table(function);
+}
+
+template <typename Function>
 void ZRemembered::oops_do_forwarded(ZForwarding* forwarding, Function function) const {
   // All objects have been forwarded, and the page could have been detached.
   // Visit all objects via the forwarding table.
@@ -105,8 +112,9 @@ bool ZRemembered::should_scan_page(ZPage* page) const {
   // If we get here, we know that the old collection is concurrently
   // relocating objects, and the page was allocated at a time that makes it
   // possible for it to be in the relocation set.
+  void* p = ZGeneration::old()->use_hash_forwarding ? (void*)ZGeneration::old()->forwarding(ZOffset::address_unsafe(page->start())) : (void*)ZGeneration::old()->compact_forwarding(ZOffset::address_unsafe(page->start()));
 
-  if (ZGeneration::old()->forwarding(ZOffset::address_unsafe(page->start())) == NULL) {
+  if (p == NULL) {
     // This page was provably not part of the old relocation set.
     return true;
   }
@@ -145,6 +153,34 @@ static void fill_containing(GrowableArrayCHeap<ZRememberedSetContaining, mtGC>* 
   }
 }
 
+void ZRemembered::scan_forwarding(ZCompactForwarding* forwarding, void* context) const {
+  if (forwarding->get_and_set_remset_scanned()) {
+    // Scanned last young cycle; implies that the to-space objects
+    // are going to be found in the page table scan
+    return;
+  }
+
+  if (forwarding->retain_page()) {
+    // Collect all remset info while the page is retained
+    GrowableArrayCHeap<ZRememberedSetContaining, mtGC>* array = (GrowableArrayCHeap<ZRememberedSetContaining, mtGC>*)context;
+    array->clear();
+    fill_containing(array, forwarding->page());
+    forwarding->release_page();
+
+    // Relocate (and mark) while page is released, to prevent
+    // retain deadlock when relocation threads in-place relocate.
+    oops_do_forwarded_via_containing(array, [&](volatile zpointer* p) {
+      scan_field(p);
+    });
+
+  } else {
+    oops_do_forwarded(forwarding, [&](volatile zpointer* p) {
+      scan_field(p);
+    });
+  }
+}
+
+
 void ZRemembered::scan_forwarding(ZForwarding* forwarding, void* context) const {
   if (forwarding->get_and_set_remset_scanned()) {
     // Scanned last young cycle; implies that the to-space objects
@@ -175,21 +211,29 @@ void ZRemembered::scan_forwarding(ZForwarding* forwarding, void* context) const 
 class ZRememberedScanForwardingTask : public ZRestartableTask {
 private:
   ZForwardingTableParallelIterator _iterator;
+  ZCompactForwardingTableParallelIterator _compact_iterator;
   const ZRemembered&               _remembered;
 
 public:
   ZRememberedScanForwardingTask(const ZRemembered& remembered) :
       ZRestartableTask("ZRememberedScanForwardingTask"),
       _iterator(ZGeneration::old()->forwarding_table()),
+      _compact_iterator(ZGeneration::old()->compact_forwarding_table()),
       _remembered(remembered) {}
 
   virtual void work() {
     GrowableArrayCHeap<ZRememberedSetContaining, mtGC> containing_array;
-
-    _iterator.do_forwardings([&](ZForwarding* forwarding) {
-      _remembered.scan_forwarding(forwarding, &containing_array);
-      return !ZGeneration::young()->should_worker_stop();
-    });
+    if (ZGeneration::old()->use_hash_forwarding) {
+      _iterator.do_forwardings([&](ZForwarding* forwarding) {
+        _remembered.scan_forwarding(forwarding, &containing_array);
+        return !ZGeneration::young()->should_worker_stop();
+      });
+    } else {
+      _compact_iterator.do_forwardings([&](ZCompactForwarding* forwarding) {
+        _remembered.scan_forwarding(forwarding, &containing_array);
+        return !ZGeneration::young()->should_worker_stop();
+      });
+    }
   }
 };
 

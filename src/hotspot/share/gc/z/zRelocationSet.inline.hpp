@@ -29,6 +29,10 @@
 #include "gc/z/zArray.inline.hpp"
 
 template <bool Parallel>
+inline ZCompactRelocationSetIteratorImpl<Parallel>::ZCompactRelocationSetIteratorImpl(ZCompactRelocationSet* relocation_set) :
+    ZArrayIteratorImpl<ZCompactForwarding*, Parallel>(relocation_set->_forwardings, relocation_set->_nforwardings) {}
+
+template <bool Parallel>
 inline ZRelocationSetIteratorImpl<Parallel>::ZRelocationSetIteratorImpl(ZRelocationSet* relocation_set) :
     ZArrayIteratorImpl<ZForwarding*, Parallel>(relocation_set->_forwardings, relocation_set->_nforwardings) {}
 

@@ -105,14 +105,14 @@ ZGenerationYoung* ZGeneration::_young;
 ZGenerationOld*   ZGeneration::_old;
 
 ZGeneration::ZGeneration(ZGenerationId id, ZPageTable* page_table, ZPageAllocator* page_allocator) :
+    _relocation_set(this),
+    _compact_relocation_set(this),
     _id(id),
     _page_allocator(page_allocator),
     _page_table(page_table),
-    _forwarding_table(),
     _workers(id, &_stat_workers),
     _mark(this, page_table),
     _relocate(this),
-    _relocation_set(this),
     _freed(0),
     _promoted(0),
     _compacted(0),
@@ -176,7 +176,7 @@ void ZGeneration::flip_age_pages(const ZRelocationSetSelector* selector) {
 
 void ZGeneration::select_relocation_set(bool promote_all) {
   // Register relocatable pages with selector
-  ZRelocationSetSelector selector(promote_all);
+  ZRelocationSetSelector selector(promote_all, this);
   {
     ZGenerationPagesIterator pt_iter(_page_table, _id, _page_allocator);
     for (ZPage* page; pt_iter.next(&page);) {
@@ -224,19 +224,27 @@ void ZGeneration::select_relocation_set(bool promote_all) {
     free_empty_pages(&selector, 0 /* bulk */);
   }
 
-  // Select relocation set
   selector.select();
-
-  // Install relocation set
-  _relocation_set.install(&selector);
-
-  // Flip age young pages that were not selected
-  flip_age_pages(&selector);
-
-  // Setup forwarding table
-  ZRelocationSetIterator rs_iter(&_relocation_set);
-  for (ZForwarding* forwarding; rs_iter.next(&forwarding);) {
-    _forwarding_table.insert(forwarding);
+  if (use_hash_forwarding) {
+    // Install relocation set
+    _relocation_set.install(&selector);
+    // Flip age young pages that were not selected
+    flip_age_pages(&selector);
+    // Setup forwarding table
+    ZRelocationSetIterator rs_iter(&_relocation_set);
+    for (ZForwarding* forwarding; rs_iter.next(&forwarding);) {
+      _forwarding_table.insert(forwarding);
+    }
+  } else {
+    // Install relocation set
+    _compact_relocation_set.install(&selector);
+    // Flip age young pages that were not selected
+    flip_age_pages(&selector);
+    // Setup forwarding table
+    ZCompactRelocationSetIterator rs_iter(&_compact_relocation_set);
+    for (ZCompactForwarding* forwarding; rs_iter.next(&forwarding);) {
+      _compact_forwarding_table.insert(forwarding);
+    }
   }
 
   // Update statistics
@@ -245,14 +253,20 @@ void ZGeneration::select_relocation_set(bool promote_all) {
 }
 
 void ZGeneration::reset_relocation_set() {
-  // Reset forwarding table
-  ZRelocationSetIterator iter(&_relocation_set);
-  for (ZForwarding* forwarding; iter.next(&forwarding);) {
-    _forwarding_table.remove(forwarding);
-  }
-
   // Reset relocation set
-  _relocation_set.reset(_page_allocator);
+  if (use_hash_forwarding) {
+    ZRelocationSetIterator rs_iter(&_relocation_set);
+    for (ZForwarding* forwarding; rs_iter.next(&forwarding);) {
+      _forwarding_table.remove(forwarding);
+    }
+    _relocation_set.reset(_page_allocator);
+  } else {
+    ZCompactRelocationSetIterator rs_iter(&_compact_relocation_set);
+    for (ZCompactForwarding* forwarding; rs_iter.next(&forwarding);) {
+      _compact_forwarding_table.remove(forwarding);
+    }
+    _compact_relocation_set.reset(_page_allocator);
+  }
 }
 
 void ZGeneration::synchronize_relocation() {
@@ -718,13 +732,22 @@ void ZGenerationYoung::relocate_start() {
   // Notify JVMTI
   JvmtiTagMap::set_needs_rehashing();
 
-  _relocate.start();
+  if (use_hash_forwarding) {
+    _relocate.start();
+  } else {
+    _relocate.start_compact();
+  }
 }
 
 void ZGenerationYoung::relocate() {
-  // Relocate relocation set
-  _relocate.relocate(&_relocation_set);
+  if (use_hash_forwarding) {
+    // Relocate relocation set
+    _relocate.relocate(&_relocation_set);
 
+  } else {
+    // Relocate relocation set
+    _relocate.relocate(&_compact_relocation_set);
+  }
   // Update statistics
   stat_heap()->at_relocate_end(_page_allocator->stats(this));
 }
@@ -746,11 +769,19 @@ void ZGenerationYoung::in_place_relocate_promote(ZPage* from_page, ZPage* to_pag
 }
 
 void ZGenerationYoung::register_flip_promoted(const ZArray<ZPage*>& pages) {
-  _relocation_set.register_flip_promoted(pages);
+  if (use_hash_forwarding) {
+    _relocation_set.register_flip_promoted(pages);
+  } else {
+  _compact_relocation_set.register_flip_promoted(pages);
+  }
 }
 
 void ZGenerationYoung::register_in_place_relocate_promoted(ZPage* page) {
-  _relocation_set.register_in_place_relocate_promoted(page);
+  if (use_hash_forwarding) {
+    _relocation_set.register_in_place_relocate_promoted(page);
+  } else {
+    _compact_relocation_set.register_in_place_relocate_promoted(page);
+  }
 }
 
 void ZGenerationYoung::scan_remembered_sets() {
@@ -1109,12 +1140,20 @@ void ZGenerationOld::relocate_start() {
   // Notify JVMTI
   JvmtiTagMap::set_needs_rehashing();
 
-  _relocate.start();
+  if (use_hash_forwarding) {
+    _relocate.start();
+  } else {
+    _relocate.start_compact();
+  }
 }
 
 void ZGenerationOld::relocate() {
   // Relocate relocation set
-  _relocate.relocate(&_relocation_set);
+  if (use_hash_forwarding) {
+    _relocate.relocate(&_relocation_set);
+  } else {
+    _relocate.relocate(&_compact_relocation_set);
+  }
 
   // Update statistics
   stat_heap()->at_relocate_end(_page_allocator->stats(this));

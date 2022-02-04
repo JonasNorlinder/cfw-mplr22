@@ -99,6 +99,10 @@ inline size_t ZRelocationSetSelectorGroup::forwarding_entries() const {
   return _forwarding_entries;
 }
 
+inline size_t ZRelocationSetSelectorGroup::compact_forwarding_entries() const {
+  return _compact_forwarding_entries;
+}
+
 inline const ZRelocationSetSelectorGroupStats& ZRelocationSetSelectorGroup::stats() const {
   return _stats;
 }
@@ -184,5 +188,10 @@ inline const ZArray<ZPage*>* ZRelocationSetSelector::not_selected_large() const 
 inline size_t ZRelocationSetSelector::forwarding_entries() const {
   return _small.forwarding_entries() + _medium.forwarding_entries();
 }
+
+inline size_t ZRelocationSetSelector::compact_forwarding_entries() const {
+  return _small.compact_forwarding_entries() + _medium.compact_forwarding_entries();
+}
+
 
 #endif // SHARE_GC_Z_ZRELOCATIONSETSELECTOR_INLINE_HPP

@@ -252,7 +252,7 @@ public:
 
   static bool is_load_bad(zpointer ptr);
   static bool is_load_good(zpointer ptr);
-  static bool is_load_good_or_null(zpointer ptr);
+  static bool is_load_good_or_null(zpointer ptr, bool assert_valid = true);
 
   static bool is_old_load_good(zpointer ptr);
   static bool is_young_load_good(zpointer ptr);
