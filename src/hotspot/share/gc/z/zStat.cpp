@@ -1390,7 +1390,8 @@ void ZStatRelocation::print() {
   }
   print("Large", _selector_stats.large(), 0 /* in_place_count */);
 
-  log_info(gc, reloc)("Forwarding Usage: " SIZE_FORMAT "M", _forwarding_usage / M);
+  // Forwarding calc:  _nforwardings * sizeof(ZForwarding*) + _nforwardings * sizeof(ZForwarding) + (_small.forwarding_entries() + _medium.forwarding_entries()) * sizeof(ZForwardingEntry)
+  log_info(gc, reloc)("Forwarding Usage: " SIZE_FORMAT "B", _forwarding_usage);
 }
 
 //
