@@ -65,6 +65,10 @@ inline int32_t ZCompactForwardingEntry::get_next_live_object(int32_t cursor, boo
   return move_cursor(cursor, count);
 }
 
+inline const bool ZCompactForwardingEntry::get_liveness(size_t index) const {
+  return (_entry >> index) & 1UL;
+}
+
 inline const size_t ZCompactForwardingEntry::get_size(int32_t cursor) const {
   int32_t mask = cursor < 32 ? (~0U) << (cursor + 1) : 0U;
   uint32_t entry = _entry & mask;
@@ -72,7 +76,15 @@ inline const size_t ZCompactForwardingEntry::get_size(int32_t cursor) const {
   return (count_trailing_zeros(entry) - cursor + 1) << 3;
 }
 
-inline const int32_t ZCompactForwardingEntry::last_live() const {
+// Assumes that size bit exists
+inline const size_t ZCompactForwardingEntry::get_size_bit(size_t liveness_index) const {
+  const size_t shift = liveness_index + 1;
+  const size_t entry = _entry >> shift;
+  const size_t width = count_trailing_zeros(entry) + 1;
+  return liveness_index + width;
+}
+
+inline const int32_t ZCompactForwardingEntry::last_bit_set() const {
   uint32_t entry = (uint32_t)_entry;
   assert(entry > 0, "count leading zeros behaviour is not defined for zero");
   return 31 - count_leading_zeros(entry);

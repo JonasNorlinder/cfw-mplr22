@@ -386,7 +386,7 @@ static zaddress compact_relocate_object_inner(ZCompactForwarding* forwarding, za
   const ZEntryStatus status = e->wait_until_locked_or_relocated();
   if (status != ZEntryStatus::relocated) {
     // Reallocate all live objects within fragment
-    const int32_t last_live_index = e->last_live();
+    const int32_t last_bit_index = e->last_bit_set();
     size_t offset_index = forwarding->has_snd_page() && from_addr >= forwarding->_first_on_snd_page ?
       forwarding->addr_to_index(from_addr) - 1 : forwarding->addr_to_index(from_addr);
 
@@ -395,8 +395,20 @@ static zaddress compact_relocate_object_inner(ZCompactForwarding* forwarding, za
     while (true) {
       const zaddress from_addr_entry = forwarding->from(offset_index, (size_t)cursor);
       const zaddress to_addr = forwarding->to(from_addr_entry, e);
-      const size_t size = cursor == last_live_index ?
+      size_t size = cursor == last_bit_index ?
         ZUtils::object_size(from_addr_entry) : e->get_size(cursor);
+
+      if (cursor < last_bit_index) {
+        while (true) {
+          size_t adjacent_index = e->get_size_bit(cursor) + 1;
+          if (adjacent_index < (size_t)last_bit_index && e->get_liveness(adjacent_index)) {
+            size += e->get_size(adjacent_index);
+            cursor = adjacent_index;
+          } else {
+            break;
+          }
+        }
+      }
       ZUtils::object_copy_disjoint(from_addr_entry, to_addr, size);
 
       cursor = e->get_next_live_object(cursor, true);
@@ -404,9 +416,9 @@ static zaddress compact_relocate_object_inner(ZCompactForwarding* forwarding, za
         break;
       }
     }
-
     e->unlock_and_mark_relocated();
   }
+
   assert(e->is_relocated(), "either fixed in place or normal");
   return forwarding->to(from_addr, e);
 }
@@ -761,17 +773,43 @@ private:
     const ZEntryStatus status = entry->wait_until_locked_or_relocated();
 
     // Reallocate all live objects within fragment
-    const int32_t last_live_index = entry->last_live();
+    const int32_t last_bit_index = entry->last_bit_set();
     const size_t offset_index = _forwarding->has_snd_page() && entry >= _forwarding->_first_on_snd_page_entry ?
       (entry - _forwarding->_compact_entries - 1) : (entry - _forwarding->_compact_entries);
 
     int32_t cursor = entry->get_next_live_object(0, false);
+
+    // Buffer to support coalesced evacuation
+    zaddress remset_buffer[16] = { zaddress::null };
+    size_t remset_buffer_size = 0;
+
     while (true) {
       const zaddress from_addr_entry = _forwarding->from(offset_index, (size_t)cursor);
       const zaddress to_addr = (zaddress)(((size_t)_forwarding->to_offset(from_addr_entry, entry)) + to_page_start);
+
+      remset_buffer[remset_buffer_size] = from_addr_entry;
+      remset_buffer_size++;
+
       if (status != ZEntryStatus::relocated) {
-        const size_t size = cursor == last_live_index ?
+        size_t size = cursor == last_bit_index ?
           ZUtils::object_size(from_addr_entry) : entry->get_size(cursor);
+
+        if (cursor < last_bit_index) {
+          // Try to coalesce
+          while (true) {
+            size_t adjacent_index = entry->get_size_bit(cursor) + 1;
+            if (adjacent_index < (size_t)last_bit_index && entry->get_liveness(adjacent_index)) {
+              size += entry->get_size(adjacent_index);
+              cursor = adjacent_index;
+
+              remset_buffer[remset_buffer_size] = _forwarding->from(offset_index, (size_t)cursor);
+              remset_buffer_size++;
+            } else {
+              break;
+            }
+          }
+        }
+
         if (in_place && to_addr + size > from_addr_entry) {
           ZUtils::object_copy_conjoint(from_addr_entry, to_addr, size);
         } else {
@@ -779,11 +817,23 @@ private:
         }
       }
 
-      update_remset_for_fields(from_addr_entry, to_addr);
       cursor = entry->get_next_live_object(cursor, true);
       if (cursor == -1) {
         break;
       }
+    }
+
+    DEBUG_ONLY(for (size_t i = 0; i < remset_buffer_size; i++) {
+      for (size_t j = 0; j < remset_buffer_size; j++) {
+        if (i != j) assert(remset_buffer[i] != remset_buffer[j], "unique");
+      }
+    })
+
+    assert(remset_buffer_size > 0 && remset_buffer_size <= 16, "");
+    for (size_t i = 0; i < remset_buffer_size; i++) {
+      const zaddress from_addr_entry = remset_buffer[i];
+      const zaddress to_addr = (zaddress)(((size_t)_forwarding->to_offset(from_addr_entry, entry)) + to_page_start);
+      update_remset_for_fields(from_addr_entry, to_addr);
     }
 
     if (status != ZEntryStatus::relocated) {

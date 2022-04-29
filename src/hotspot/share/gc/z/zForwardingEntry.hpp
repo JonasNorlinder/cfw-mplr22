@@ -58,6 +58,7 @@ public:
     _entry(0) {}
 
   // Liveness and size bits describes one fragment
+  const bool get_liveness(size_t index) const;
   void set_liveness(size_t index);
   void set_size_bit(size_t index, size_t size);
 
@@ -68,7 +69,8 @@ public:
   void set_live_bytes_before_fragment(size_t value);
 
   const size_t get_size(int32_t cursor) const;
-  const int32_t last_live() const;
+  const size_t get_size_bit(size_t liveness_index) const;
+  const int32_t last_bit_set() const;
   const size_t live_bytes_on_fragment(uintptr_t old_page, uintptr_t from_offset, const ZCompactForwarding* fw) const;
 
   void mark_as_relocated();
