@@ -12,16 +12,25 @@ inline uint32_t ZCompactForwardingEntry::live_bytes_before_fragment() const {
 }
 
 inline void ZCompactForwardingEntry::set_live_bytes_before_fragment(size_t value) {
+  assert((value >> 18) == 0, "overflow");
   assert(!is_relocated(), "Updating not allowed");
-  // 0xC0000000FFFFFFFF =
-  // 11000000 00000000 00000000 00000000 11111111 11111111 11111111 11111111
-  _entry = field_live_bytes::encode((uint32_t)value) | (_entry & 0xC0000000FFFFFFFF);
+  // 0xFFFC0000FFFFFFFF =
+  // Relocated
+  // |Lock
+  // || Partial map
+  // || |
+  // 11 111111 111111 000000000000000000 11111111111111111111111111111111
+  _entry = field_live_bytes::encode((uint32_t)value) | (_entry & 0xFFFC0000FFFFFFFF);
 }
 
 inline void ZCompactForwardingEntry::set_liveness(size_t index) {
   assert(!is_relocated(), "Updating liveness not allowed");
   assert(index < 32, "Invalid index");
-  _entry |= 1ULL<< index;
+  _entry |= 1ULL << index;
+}
+
+inline const bool ZCompactForwardingEntry::get_liveness(size_t index) const {
+  return ((1ULL) << index) & _entry;
 }
 
 inline void ZCompactForwardingEntry::set_size_bit(size_t index, size_t size) {
@@ -39,7 +48,6 @@ inline void ZCompactForwardingEntry::set_size_bit(size_t index, size_t size) {
   }
   set_liveness(size_index);
 }
-
 
 static inline const size_t fragment_internal_index(uintptr_t old_page, uintptr_t from_offset) {
   assert(from_offset >= old_page, "invalid from_offset");
