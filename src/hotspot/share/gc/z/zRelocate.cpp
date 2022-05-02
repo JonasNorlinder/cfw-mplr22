@@ -390,19 +390,52 @@ static zaddress compact_relocate_object_inner(ZCompactForwarding* forwarding, za
     size_t offset_index = forwarding->has_snd_page() && from_addr >= forwarding->_first_on_snd_page ?
       forwarding->addr_to_index(from_addr) - 1 : forwarding->addr_to_index(from_addr);
 
+    const int32_t obj_bit_index = (int32_t)forwarding->addr_to_internal_index(from_addr);
     int32_t cursor = e->get_next_live_object(0, false);
 
+    size_t count = 1;
+
+    // Speculatively assume we can do partial evacuation
+    size_t partial_cursor = e->get_next_live_object(0, false);
+    if (!forwarding->_in_place) {
+      while (count <= 12) {
+        if (partial_cursor == (size_t)obj_bit_index) { // Found the object
+          if (e->get_partial(count - 1)) {
+            e->unlock();
+            return forwarding->to(from_addr, e);
+          } else {
+            const zaddress to_addr = forwarding->to(from_addr, e);
+            const size_t size = partial_cursor == (size_t)last_live_index ?
+              ZUtils::object_size(from_addr) : e->get_size(partial_cursor);
+            ZUtils::object_copy_disjoint(from_addr, to_addr, size);
+            e->set_partial(count - 1);
+            e->unlock();
+            return forwarding->to(from_addr, e);
+          }
+        }
+        partial_cursor = e->get_next_live_object(partial_cursor, true);
+        count++;
+      }
+    }
+
+    cursor = e->get_next_live_object(0, false);
+    count = 1;
+
+    // Full evacuation
     while (true) {
-      const zaddress from_addr_entry = forwarding->from(offset_index, (size_t)cursor);
-      const zaddress to_addr = forwarding->to(from_addr_entry, e);
-      const size_t size = cursor == last_live_index ?
-        ZUtils::object_size(from_addr_entry) : e->get_size(cursor);
-      ZUtils::object_copy_disjoint(from_addr_entry, to_addr, size);
+      if (!e->get_partial(count - 1) || count > 12) {
+        const zaddress from_addr_entry = forwarding->from(offset_index, (size_t)cursor);
+        const zaddress to_addr = forwarding->to(from_addr_entry, e);
+        const size_t size = cursor == last_live_index ?
+          ZUtils::object_size(from_addr_entry) : e->get_size(cursor);
+        ZUtils::object_copy_disjoint(from_addr_entry, to_addr, size);
+      }
 
       cursor = e->get_next_live_object(cursor, true);
       if (cursor == -1) {
         break;
       }
+      count++;
     }
 
     e->unlock_and_mark_relocated();
@@ -766,24 +799,31 @@ private:
       (entry - _forwarding->_compact_entries - 1) : (entry - _forwarding->_compact_entries);
 
     int32_t cursor = entry->get_next_live_object(0, false);
+    size_t count = 1;
     while (true) {
       const zaddress from_addr_entry = _forwarding->from(offset_index, (size_t)cursor);
       const zaddress to_addr = (zaddress)(((size_t)_forwarding->to_offset(from_addr_entry, entry)) + to_page_start);
-      if (status != ZEntryStatus::relocated) {
-        const size_t size = cursor == last_live_index ?
-          ZUtils::object_size(from_addr_entry) : entry->get_size(cursor);
-        if (in_place && to_addr + size > from_addr_entry) {
-          ZUtils::object_copy_conjoint(from_addr_entry, to_addr, size);
-        } else {
-          ZUtils::object_copy_disjoint(from_addr_entry, to_addr, size);
+
+      if (!entry->get_partial(count - 1) || count > 12) {
+        if (status != ZEntryStatus::relocated) {
+          const size_t size = cursor == last_live_index ?
+            ZUtils::object_size(from_addr_entry) : entry->get_size(cursor);
+          if (in_place && to_addr + size > from_addr_entry) {
+            ZUtils::object_copy_conjoint(from_addr_entry, to_addr, size);
+          } else {
+            ZUtils::object_copy_disjoint(from_addr_entry, to_addr, size);
+          }
         }
       }
+
+
 
       update_remset_for_fields(from_addr_entry, to_addr);
       cursor = entry->get_next_live_object(cursor, true);
       if (cursor == -1) {
         break;
       }
+      count++;
     }
 
     if (status != ZEntryStatus::relocated) {

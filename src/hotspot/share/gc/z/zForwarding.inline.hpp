@@ -264,7 +264,7 @@ inline void ZCompactForwarding::populate_compact_entries() {
 
     if (first) {
       first = false;
-      _compact_entries->set_live_bytes_before_fragment(offset);
+      _compact_entries->set_live_bytes_before_fragment(offset >> object_alignment_shift());
     }
 
     // Copy liveness information
@@ -276,7 +276,7 @@ inline void ZCompactForwarding::populate_compact_entries() {
     // Allocate for object
     if (current_entry < entry) {
       current_entry = entry;
-      current_entry->set_live_bytes_before_fragment(offset);
+      current_entry->set_live_bytes_before_fragment(offset >> object_alignment_shift());
     }
 
     offset += object_size;
@@ -333,7 +333,7 @@ inline const zaddress ZCompactForwarding::to(zaddress from_addr, const ZCompactF
 }
 
 inline const zaddress ZCompactForwarding::to_offset(const zaddress from_addr, const ZCompactForwardingEntry* entry) const {
-  const size_t live_bytes_before_fragment = entry->live_bytes_before_fragment();
+  const size_t live_bytes_before_fragment = entry->live_bytes_before_fragment() << object_alignment_shift();
 
   return
     (zaddress)(

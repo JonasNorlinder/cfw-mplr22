@@ -43,7 +43,8 @@ class ZCompactForwardingEntry {
   friend class ZCompactForwarding;
 private:
   typedef ZBitField<uint64_t, uint32_t, 0, 32>     field_live_bits;
-  typedef ZBitField<uint64_t, uint32_t, 32, 30>    field_live_bytes;
+  typedef ZBitField<uint64_t, uint32_t, 32, 18>    field_live_bytes;
+  typedef ZBitField<uint64_t, bool, 50, 12>        field_partial;
   typedef ZBitField<uint64_t, bool, 62, 1>         field_locked;
   typedef ZBitField<uint64_t, bool, 63, 1>         field_relocated;
 
@@ -58,8 +59,12 @@ public:
     _entry(0) {}
 
   // Liveness and size bits describes one fragment
+  const bool get_liveness(size_t index) const;
   void set_liveness(size_t index);
   void set_size_bit(size_t index, size_t size);
+
+  const bool get_partial(size_t count) const;
+  void set_partial(size_t count);
 
   int32_t move_cursor(int32_t cursor, bool count) const;
   int32_t get_next_live_object(int32_t cursor, bool count) const;
