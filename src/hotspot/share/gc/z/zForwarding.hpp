@@ -50,6 +50,7 @@ public:
   const ZVirtualMemory   _virtual;
   const size_t           _object_alignment_shift;
   ZCompactForwardingEntry* _compact_entries;
+  ZPartialEntry* _partial_entries;
   ZPage* const           _page;
   ZCompactForwarding*           _prev;
   ZCompactForwarding*           _next = NULL;
@@ -91,6 +92,18 @@ public:
   const size_t addr_to_index(zaddress addr) const;
   size_t addr_to_internal_index(zaddress addr) const;
 
+  inline void set_partial(zaddress addr) {
+    const size_t external_index = ((ZAddress::offset(addr) - _virtual.start()) >> 8);
+    const size_t internal_index = addr_to_internal_index(addr);
+    _partial_entries[external_index].set_partial(internal_index);
+  };
+
+  inline const bool get_partial(zaddress addr) {
+    const size_t external_index = ((ZAddress::offset(addr) - _virtual.start()) >> 8);
+    const size_t internal_index = addr_to_internal_index(addr);
+    return _partial_entries[external_index].get_partial(internal_index);
+  };
+
   size_t offset_to_index_raw(zaddress addr) const;
 
   bool has_snd_page() const;
@@ -129,6 +142,7 @@ public:
   ZCompactForwarding(ZPage* page, bool to_old, ZCompactForwarding* prev);
   ~ZCompactForwarding() {
     free(_compact_entries);
+    free(_partial_entries);
   }
 
   static uint32_t nentries(const ZPage* page);

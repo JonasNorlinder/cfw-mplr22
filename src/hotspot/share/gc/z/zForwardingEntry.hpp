@@ -38,12 +38,27 @@ enum class ZEntryStatus : uint8_t {
   relocated
 };
 
+class ZPartialEntry {
+  uint32_t _bitmap = 0;
+public:
+  ZPartialEntry() :
+    _bitmap(0) {};
+
+  inline const bool get_partial(size_t index) const {
+    return ((1ULL) << index) & _bitmap;
+  }
+  inline void set_partial(size_t index) {
+    _bitmap |= 1ULL << index;
+  }
+};
+
 /// FIXME: move to another file
 class ZCompactForwardingEntry {
   friend class ZCompactForwarding;
 private:
   typedef ZBitField<uint64_t, uint32_t, 0, 32>     field_live_bits;
-  typedef ZBitField<uint64_t, uint32_t, 32, 30>    field_live_bytes;
+  typedef ZBitField<uint64_t, uint32_t, 32, 18>    field_live_bytes;
+  typedef ZBitField<uint64_t, bool, 50, 12>        field_partial;
   typedef ZBitField<uint64_t, bool, 62, 1>         field_locked;
   typedef ZBitField<uint64_t, bool, 63, 1>         field_relocated;
 
@@ -58,6 +73,7 @@ public:
     _entry(0) {}
 
   // Liveness and size bits describes one fragment
+  const bool get_liveness(size_t index) const;
   void set_liveness(size_t index);
   void set_size_bit(size_t index, size_t size);
 
